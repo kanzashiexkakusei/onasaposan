@@ -1,0 +1,479 @@
+# 挿絵生成（SillyTavern "Last message" 模倣）実装メモ
+
+調査時点: 2026-10-03。上流 geminipwa commit `85413a9` を基点。
+
+## 1. 本リポジトリ（geminipwa 系 PWA）の構造
+
+クライアント完結の単一ファイル PWA。`index.html` 内に HTML と JS が全部入っている。
+
+| 項目 | 場所（index.html） |
+| --- | --- |
+| DB 定数 | `DB_NAME='GeminiPWA_DB'`, `DB_VERSION=8`, `SETTINGS_STORE='settings'`, `CHATS_STORE='chats'` |
+| 設定の既定値 | `state.settings = { ... }`（`const state` の中） |
+| 設定の読み込み | `dbUtils.loadSettings()` — `for (const key in loadedSettings)` かつ `if (key in defaultSettings)` のキーのみ採用。既定値にキーを追加すれば自動的に保存・復元対象になる |
+| 設定の保存 | `appLogic.saveSettings()` が input から `newSettings` を組み立て、`dbUtils.saveSetting(key, value)` をキー単位で put |
+| 設定の UI 反映 | `uiUtils.applySettingsToUI()` |
+| 要素参照 | `const elements = { ... }`（`document.getElementById` のマップ） |
+| 履歴保存 | `dbUtils.saveChat()` — `state.currentMessages` を **ホワイトリスト方式**で map している。メッセージに新フィールドを増やすならここへの追加が必須 |
+| メッセージ描画 | `uiUtils.renderChatMessages()` → 1件ずつ `uiUtils.appendMessage(role, content, index, isStreamingPlaceholder, cascadeInfo, attachments)`。`messageDiv` は `elements.messageContainer` 直下。モデルメッセージの actions 生成部（`.js-retry-btn` あたり）が挿絵ブロックを足す位置 |
+| 入力欄 | `<footer class="chat-input-area">` 内の `<textarea id="user-input">`。付近の `.footer-action-button` がボタン用の既存クラス |
+| 設定画面 | `<details class="settings-group"><summary>…</summary>` の入れ子。新規セクションはこの形に合わせる |
+
+### LLM 呼び出し経路（quiet 生成に使うもの）
+
+`appLogic.handleSend(isRetry, retryUserMessageIndex, sourceSessionContext, isTopLevelCall)`。
+`sourceSessionContext` を渡すと `isBackgroundProcess = true` になり、**チャット履歴にも画面にも残さず**
+`{ content, metadata }` を return する。校正 `appLogic.proofreadText()` がこの使い方の実例。
+
+```js
+const ctx = {
+  sessionId: null, messages: [], systemPrompt, inputText, attachments: [],
+  apiProvider, _apiKeyOverride, _modelNameOverride, temperature, maxTokens, ...
+};
+const res = await this.handleSend(false, -1, ctx, false);
+```
+
+`messages` に配列を渡すとそれをそのまま文脈として使い、`inputText` を最後のユーザー発話として送る。
+API キー・モデル名は呼び出し側で渡す（`state.settings.apiProvider` 等の通常解決も fallback される）。
+
+### 応答完了のタイミング
+
+`handleSend` の `try` 末尾、`if (!isBackgroundProcess) { … twin engine … }` の直後が
+ストリーミング・非ストリーミング両経路の共通終点。`catch` に入れば本編が失敗・中断なので、
+自動トリガーはここに置く（中断・エラーでは走らない）。
+
+## 2. SillyTavern の Last message の実処理（自分の言葉）
+
+対象は `generationMode.NOW = 4`。UI 上のトリガー語は `last`（`RAW_LAST = 3` は別物）。
+
+1. `getQuietPrompt(NOW, trigger)` は `stringFormat(promptTemplates[NOW], trigger)`。
+   NOW のテンプレートには `{0}` が無いので、**トリガー語は本文に挿入されず、テンプレートだけが送られる**。
+2. `generatePrompt(quietPrompt)` → `generateQuietPrompt({ quietPrompt })` → `Generate('quiet', …)`。
+   つまり **これまでのチャット全文を文脈にしたうえで、最後の発話としてこの指示文を送る**。
+   返答はチャットに追加しない（quiet）。`force_name2: true` で応答のみ取り出す。
+3. 返文は `processReply()` で整形する: 引用符除去、改行→`, `、NFD 正規化、
+   英数と `, . : _ ( ) { } < > [ ] / - ' | #` 以外を空白化、空白圧縮、カンマで分割して trim・再結合。
+   reasoning は `removeReasoningFromString` で落とす。
+4. 合成は `combinePrefixes(a, b)`（trim → 前後カンマ除去 → `a, b,`）。
+   - prefix = `combinePrefixes(sd.prompt_prefix, characterPrefix)`
+   - `prefixedPrompt = combinePrefixes(prefix, prompt, '{prompt}')` — prefix 側に `{prompt}` マクロがあればそこへ差し込み、無ければ末尾に `, prompt,` として連結
+   - negative = `combinePrefixes(additionalNegative, combinePrefixes(sd.negative_prompt, characterNegativePrefix))`
+5. ComfyUI への差し込み（`generateComfyImageCommon`）:
+   ```js
+   workflow.replaceAll('"%prompt%"', JSON.stringify(prompt));
+   workflow.replaceAll('"%negative_prompt%"', JSON.stringify(negativePrompt));
+   workflow.replaceAll('"%seed%"', JSON.stringify(seed));
+   placeholders.forEach(ph => workflow.replaceAll(`"%${ph}%"`, JSON.stringify(extension_settings.sd[ph])));
+   ```
+   **`"%xxx%"` のように「JSON 文字列リテラル全体」として一致した場合だけ** `JSON.stringify` で置換する。
+   部分一致で本文を壊さないためのこの形を ST は採っている。
+   seed は `seed >= 0 ? seed : Math.round(Math.random() * Number.MAX_SAFE_INTEGER)`。
+   実際の ST が持つトークンは `prompt / negative_prompt / seed / denoise / clip_skip / model / vae /
+   sampler / scheduler / steps / scale / width / height` に加えて `user_avatar / char_avatar`。
+   **SillyTavern の CFG トークンは `%scale%`**で、`%cfg%` は存在しない。
+   本アプリは ComfyUI 本体の表記に合わせて **`%cfg%` だけ**を検出・置換する（`%scale%` は廃止した）。
+   **clip_skip は ST では負値で送られる**（`-extension_settings.sd.clip_skip`、NaN なら `-1`）。
+   ST にテキストエンコーダのトークンは無い（本アプリが `%text_encoder%` を追加している）。
+   ST のカスタム プレースホルダは `{find, replace}` の任意文字列 `replaceAll` で、replace 値は `substituteParams` を通る。
+6. SillyTavern は ComfyUI を自前サーバー経由（`/api/sd/comfy/generate`）で叩く。
+   **本 PWA はサーバーを持たないので、ブラウザから直接 `POST /prompt` → `GET /history/{id}` → `GET /view` を行う**
+   （ここが唯一 SillyTavern と形が変わる箇所。仕様通り）。
+
+## 3. 実装で踏む制約
+
+- 別オリジンなので ComfyUI 側は `--enable-cors-header` が必須。接続確認と失敗メッセージに出す。
+- `/view` の URL は ComfyUI の一時参照。取得したバイトを data URL で履歴に保存し、保存前に縮小・上限をかける。
+- 挿絵の失敗は本編テキストと分離して、そのメッセージ直下にだけ表示する。
+- 同時実行は 1 件。`state.illustrationJob` でロックする。
+- 設定・ワークフロー・個人 URL をソースにハードコードしない（既定は空、説明文のみ）。
+
+## 4. 実装中に分かった、仕様書に無い挙動
+
+- **Service Worker が接続失敗を 503 に化かせる**。上流 sw.js はキャッシュミス後の fetch が
+  失敗すると `Network error occurred.` の 503 を合成して返す。そのため ComfyUI が落ちていても
+  ページ側は `TypeError: Failed to fetch` ではなく HTTP 503 を受け、CORS の案内が出せなかった
+  （実測で確認）。sw.js でプライベートアドレス（127./10./192.168./172.16-31./100./localhost/.local）
+  への要求をキャッシュ戦略から外して常にネットワークへ通し、客户端でも合成応答を検知する。
+- **SillyTavern の CFG トークンは `%scale%`**。`%cfg%` は存在しない。本アプリは ComfyUI 本体のキー名に寄せて `%cfg%` のみ（`%scale%` は廃止）。
+- **`processReply` の厳格な整形は日本語を全消しにする**（許容文字が英数字と記号のみ）。
+  日本語の応答では必ず空になるため、空になった場合だけ最小限の整形へフォールバックする。
+  設定で明示選択もできるようにした。
+- **ワークフロー検証は LLM より前**に置く。不正なワークフローでトークンを消費しない。
+- 本 PWA はサーバーを持たないので、SillyTavern がサーバー側でやっていた
+  `/history` ポーリングと `/view` 取得をブラウザで行う。ここが唯一の構造的な違い。
+
+## 4b. 初版の実不具合と、その再発防止（差し込み方式の改訂）
+
+初版は ST と同じ「生テキストへの `replaceAll('"%token%"', …)`」を踏襲していたが、次の理由で失敗した。
+**プレースホルダが未差し込みのまま ComfyUI へ送られ、ComfyUI がエラーを返した。**
+
+- 差し込み対象が `prompt / negative_prompt / seed / width / height / steps / cfg / scale` の 8 個だけで、
+  ST が実際に持つ `%model% %vae% %sampler% %scheduler% %denoise% %clip_skip%` とカスタム トークンを一度も置換しなかった。
+  検証 UI 自体が「未対応のためそのまま」と表示していた。
+- 生テキスト置換なので、`"text": "masterpiece, %prompt%"` のような文中のトークンも残った。
+
+改訂後の方式:
+
+- ワークフローを **パースしてから再帰走査**し、文字列値の中身だけを `substituteInString` で処理する。
+  値そのものが `%token%` なら値をそのまま（数値は quotes なしで）返し、文中なら `String(value)` を補間する。
+  テキストを継ぎ接ぎして再パースしないため、「差し込み後に JSON が壊れる」というエラー級が構造的に消えた。
+- 未対応トークンは `unresolved` に集約し、**2 相で止める**。
+  第 1 相 `prepareWorkflow` は LLM を呼ぶ前に走り（トークンを消費しない）、
+  `prompt / negative_prompt / user_avatar / char_avatar` 以外で差し込み、残ったものを名指しで中断する。
+  第 2 相 `applyPromptTokens` の後、POST 直前に `findUnresolvedTokens` で値そのものが `%token%` のまま残っていないか確認する。
+- 検証ボタンと編集画面のトークン検出は、生成経路と同じ `prepareWorkflow` を使う。
+  検証と実生成が食い違わない。
+- ST との意図的な差異: カスタム プレースホルダは JSON Aware で、ST のような「任意文字列の `replaceAll`」は表現できない
+  （find は `%[a-zA-Z_][a-zA-Z0-9_]*%` の形に限る）。文中埋め込みが効く分、ST より寛容になっている。
+- 補足: `illustrationUtils` は `tools/selftest.js` が**波括弧を数えて**抜き出す。
+  このオブジェクト内に不均衡な波括弧（文字列・正規表現・コメント・テンプレートリテラル内を含む）や
+  数量指定 `{1,40}`、`dbUtils` / `uiUtils` / モジュール定数への参照を入れると抜き出し・eval に失敗する。
+  副作用のある処理（fetch・DOM・IndexedDB）は `comfyWorkflowUtils` 側へ置いた。
+
+## 5. 検証
+
+- `node tools/selftest.js` — 抜き出した純ロジック（147件）。
+  文中埋め込みの置換、`%model%` 等の解決、CLIP Skip の負値、未対応トークンの中断、
+  カスタム プレースホルダ、ワークフロー一覧の自己修復まで。
+- `node tools/e2e.js` — モック ComfyUI に対して headless Chrome で実際に走らせる（158件）。
+  手動生成・自動生成・手動で勝手に走らない・履歴復元・本編保持・CORS 判別・
+  不正ワークフロー・連打・SW 登録に加えて、
+  **SillyTavern 系トークンが全て差し替わること**、`!/%[a-z_]+%/` で**未差し込みを送っていないこと**、
+  未知トークンでは **POST も LLM も走らないこと**、`object_info` からのプルダウン反映と
+  ノード types 欠損時の劣化、**「接続確認＆モデル一覧取得」が接続OKを先に出し model 一覧と LoRA を
+  1 回の `object_info` で一緒に取ること**、ワークフロー CRUD、複数枚の ◀▶・全画面・1枚/全枚の削除・
+  送信前編集・LoRA の 3 分岐（使用 / 不使用+ファイルあり / 不使用+フォルダ空）まで確認する。
+
+## 6. 手直しラウンド（2026-10-05）
+
+### 再生成の遅さ
+実機で「再生成 → ComfyUI の `got prompt`」まで数秒空いていた。原因は
+**再生成のたびに quiet プロンプトをクラウド LLM で作り直していた**こと。
+`generateIllustration` は保存済み `illustration.prompt` があれば LLM を呼ばず、その文字列をそのまま送る。
+無ければ初回生成として LLM を呼ぶ。入力の `画` ボタンも同じ規則（画像済み応答＝再生成、画像なし応答＝初回生成）。
+切り分け用に、起動・プロンプト確定・`POST /prompt` 送信直前・POST 完了・history 完了の各時刻を
+`[挿絵]` プレフィックスでコンソールへ出す。
+
+### 複数枚
+`message.illustration` は `images: [{dataUrl, filename, bytes, resized, seed, prompt, createdAt}]` と
+`viewIndex` を持つ。旧形式（`imageDataUrl` を直で持っていた保存済み履歴）は
+`normalizeIllustration` が読み出し時に寄り込む。再生成は末尾へ足して表示だけ切り替えるので、古い画像は消えない。
+1枚削除で 0 枚になったら `illustration` 自体を null にしてブロックごと消す。
+
+### LoRA
+トークン差し込みとは別に、**ノード単位のパッセージ**（`applyLoraNodes`）で決める。
+`class_type` が `LoraLoader` / `LoraLoaderModelOnly` のノードを ID 順にスロット 1〜4 へ対応させる。
+
+| 条件 | 挙動 |
+| --- | --- |
+| 使う / ファイルあり | 選んだファイル名と強度を入れる（ModelOnly は `strength_model` のみ） |
+| 使う / フォルダ空 | 送らず `LoRAを使うには ComfyUI の loras フォルダにファイルが必要です` |
+| 使わない / ファイルあり | ノードの形は変えず、一覧先頭の実在ファイル名と強度 0 |
+| 使わない / フォルダ空 | そのノードだけ削除し、`model` / `clip` を受け先へ直結 |
+| 一覧取得失敗 | ノードに書かれた値のまま送る（生成は止めない） |
+
+**受け取れるスロット数**は `loraSlotCapacity` が決める。`%loraN%` を参照する LoraLoader ノードの数と、
+rgthree の `lora_1`〜`lora_4` の存在数の大きい方（4 上限）。対応 LoRA は 4 個までで、UI はこれより大きい番号の
+スロットを無効にし、`setLoraSlot` も受け付けない（選んでも効かないため）。ワークフローごとの記憶は 4 個分残るので、
+ワークフロー側でスロットを増やせば戻る。
+
+**rgthree のスロットが制御できるか**は `rgthreeSlotControl` / `rgthreeSlotControls` が決める。スロット全体の
+JSON 文字列に `%loraN%` と `%lora_strN%` が入っているかで見る（**番号も一致させる**。`lora_2` に `%lora3%` だと
+`on` はスロット2、名前はスロット3 になって別物の LoRA になる）。強度欄は版によって `strength` /
+`strength_model` + `strength_clip` と名前が変わるので、キー名では見ない。判定に使う JSON は必ず**差し込み前**
+（`parsed.object` / `sourceObject`）で、`prepareWorkflow` 後にはプレースホルダが値に置き換わって消えている。
+
+- `%loraN%` の無いスロット → `applyRgthreeLoraNodes` は `on` を触らず、ワークフローに書かれた LoRA 名をそのまま送る
+  （固定名を書いた LoraLoader ノードに触らないのと同じ約束）。UI は select を無効にして理由を行に出す
+- `%lora_strN%` の無いスロット → LoRA 名は効き、強度だけ JSON の値のまま。UI は強度欄だけを無効にする
+
+**LoRA 検出はリアルタイム**で行う。`comfyWorkflowUtils.detectionWorkflow()` は保存済み JSON ではなく
+**テキストエリアの内容**を返し、`detectLoraState()` が parse を 1 回にまとめて capacity と制御可否を出す。
+textarea の `input` で `renderTokenStatus` / `renderLoraWarnings` / `renderLoraRows` を同時に呼ぶので、
+`%loraN%` を打ち込んだ瞬間にプルダウンと強度欄が有効になり、消すと元に戻る（`%prompt%` 検出と同じ操作感）。
+`setLoraSlot` も同じ出典を見るため、表示と受け付けが食い違わない。ワークフロー編集欄の直下
+（`#comfy-workflow-lora-warnings`）には検出内訳（標準ノード数 / rgthree 数 / 受け取れる数）と警告を並べる。
+JSON が読めない間は capacity を 4 のままにして選択を奪わない（送信前にワークフロー検証で止まる）。
+警告文は `rgthreeSlotWarningSummary` が LoRA 欄の行・LoRA 欄の下の要約・編集欄下の警告の 3 か所分を共通生成する。
+
+**編集欄の反映は LoRA 判定より先。** 検出は編集欄の JSON を見るので、`syncLoraSlotsWithActiveWorkflow()` は
+`renderEditor()` を先に呼ぶ。反映前に判定すると、固定 LoRA の①から LoRA 対応の②へ切り替えたときに
+①の JSON で capacity 0 と判定され、4 スロットとも無効のまま残る（`renderEditor` は `renderLoraRows` を呼ばない）。
+
+**LoRA 一覧の取得は 2 経路。** `ensureLoraChoices()` は使用中のワークフローが LoRA を受け取るときだけ
+`GET /models/loras` を取りに行く（`loraChoices` が既にある / capacity 0 / 接続先が空なら何もしない。
+object_info は取らない）。ワークフローの切り替え・追加・複製・削除は `syncLoraSlotsWithActiveWorkflow()` に
+集約してあり、`applyLoraSlotsForActiveWorkflow()` の後に呼ぶ。ここでは **await しない**（ComfyUI が止まっていても
+切り替えを待たせず、失敗時は LoRA 欄に理由を出すだけ）。もう 1 経路は「接続確認＆モデル一覧取得」で、
+`refreshChoices` が object_info から得た一覧を `applyLoraChoices` → `setLoraChoices` で反映する。
+挿絵設定グループを開いたときは、object_info が新しければ `ensureLoraChoices()` だけ、古ければ
+`refreshChoices()` を呼ぶ。一覧は `illustrationUtils.loraCache` を通るので、生成時の再取得は省ける。
+
+生成は止めない（固定強度は正当な設定）。`loraSlotCapacity` はスロット数だけを見る設計のまま制御可否を別立てにし、
+ワークフローごとの記憶（`clampSlotsToCapacity`）へ影響させない。ComfyUI の画面では rgthree の欄に
+`%loraN%` を入力できない（実ファイル名のドロップダウン）ので、自作する場合は API 形式でエクスポート後に JSON を編集する必要がある。
+
+`%loraN%` / `%lora_strN%` は `buildTokenValues` で常に値を用意するので未対応トークンエラーにはならず、
+LoraLoader ノードには後段の `applyLoraNodes` が実際の値を上書きする。
+一覧は「接続確認＆モデル一覧取得」で `object_info` の `LoraLoader` / `LoraLoaderModelOnly` から取り、
+`illustrationUtils.loraCache` にも入れる（`base` と取得時刻で照合、5分）。object_info に一覧が無い環境では
+生成経路の `fetchLoraNames` が `GET /models/loras`（無ければ `/loras`）を取り、同じ 5分キャッシュを使う。
+つまり一覧取得済みなら生成時に `/models/loras` は走らない。
+
+### 同梱の規定ワークフロー
+`DEFAULT_COMFY_WORKFLOW_OBJECT` を設定の初期値と README に置いた。SillyTavern 既定ではなく本アプリ制作。
+チェックポイントから MODEL / CLIP / VAE をすべて取るので VAELoader も TextEncoderLoader も不要。
+`comfySampler` / `comfyScheduler` は既定値を初期状態から持つため、`%sampler%` / `%scheduler%` が
+初期状態でも解決される。ワークフローが 0 件になった場合は起動時に同梱分を戻す。
+
+### 生成パラメータの既定値
+Anima / SDXL 系でそのまま使える値を既定にしている（`DEFAULT_COMFY_*` 定数と `state.settings` の初期値）。
+
+| 項目 | 既定値 |
+| --- | --- |
+| Sampling method | `euler` |
+| Scheduler | `simple` |
+| 幅 x 高さ | 1024 x 1024 |
+| 解像度プリセット | `1024x1024`（1024 x 1024 (SDXL)） |
+| Steps | 8 |
+| CFG scale | 1.0 |
+| Denoise | 1 |
+| CLIP Skip | 1 |
+| seed | -1（毎回ランダム） |
+
+解像度プリセットの既定は `DEFAULT_COMFY_RESOLUTION_PRESET` が持つ。プリセットは `custom` 以外を選ぶと幅・高さへ
+反映されるだけなので、既定の 1024x1024 と幅・高さの既定値は同じ値で揃っている。
+既定値が変わるのは新規／未保存の設定だけで、IndexedDB に保存済みの値はそのまま残る（設定の移行処理は無い）。
+
+## 7. 挿絵生成に送る履歴の範囲（2026-10-10 改訂）
+
+### 問題
+`buildIllustrationPrompt` は対象応答までの履歴を**全件** quiet 生成へ渡していた。
+本アプリには入力側の上限設定が無い。`Max Tokens` は `maxOutputTokens`（出力側）だけで、
+横の「上限指定」欄はスライダーの目盛りを変えるだけなので、長い会話では挿絵1枚ごとの入力が
+会話長に比例して増え、context window を超えると 400 が返る。
+2026-10-09 に往復数で絞る設定を入れたが、範囲外へ出た登場人物の外見の記述が効かず絵が崩れるため、
+既定は全件に戻し、上限を文字数で設定する形へ改めた。
+
+### 本家 SillyTavern の仕様（2026-10-10 にソースで確認）
+本家に「履歴の往復数」に相当する設定は無い。範囲はすべてトークン予算の残りで決まる。
+- Chat Completion: `setTokenBudget(openai_max_context, openai_max_tokens)` で `tokenBudget = context - response`。
+  `populateChatHistory()` が `canAfford()` を通る分だけ新しい方から積んで古い方を落とす（`public/scripts/openai.js`）。
+  `Chat History` プロンプト項目は ON/OFF と挿入位置だけで、範囲を示す数値設定は無い
+- Text Completion: `checkPromptSize()` が `mesSend.shift()` で最古から落とす（`public/script.js`）
+- 画像生成拡張（`/sd last` など）は `generateQuietPrompt({ quietPrompt })` を呼ぶだけで `responseLength` も渡さず、
+  拡張側にトークン関連の設定も無い。予算は本編生成と同一の `Context Size` / `Response Size`
+  （Chat Completion Preset に保存される）
+- 外見は履歴から復元させない。`getRawLastMessage()` は LLM を呼ばず `character.scenario` と
+  `character.description` を直接結合する
+
+### 仕様
+- 既定は**全件送信**（`DEFAULT_ILLUSTRATION_HISTORY_CHAR_CAP = 0`）。数を入れると古い方から省略する。
+- 設定キーは `state.settings.illustrationHistoryCharCap`（0 = 全件、空欄は既定の 0）。
+- UI は「設定 → 挿絵生成（ComfyUI）→ 挿絵生成用プロンプト」内の
+  `挿絵生成の推論に使う履歴の上限(文字数)` **1つだけ**。number input で `min="0"`、スライダーは付けない
+  （`0` が「全件」でスライダーの目盛りの意味と衝突するため）。
+  注釈は `※ 設定値0でチャット履歴全てを画像生成の推論に使います。（通常チャット1回と同じ消費トークン）` と
+  `※ 画像再生成時はプロンプトを使いまわしますのでノーコストです。` の2行。
+  再生成が保存済みプロンプトを再利用する件は、quiet 生成の注釈ではなくこちらへ寄せる
+  （「画像プロンプトを送信前に編集する」の注釈からは、編集が走らない旨の1行を落とした）。
+- 最後の1件（挿絵の対象応答）は上限を超えても残す。
+- 2026-10-09 に入れた往復数の仕組み（`illustrationHistoryRounds` / `DEFAULT_ILLUSTRATION_HISTORY_ROUNDS` /
+  `comfy-history-rounds`）は設定キーごと撤去した。保存済みの `illustrationHistoryRounds` は読まれなくなるので放置。
+
+### 実装
+`illustrationUtils.trimHistoryForIllustration(messages, charCap)` が
+`{ messages, totalRounds, keptRounds, cutByChars }` を返す。`buildIllustrationPrompt` は
+`slice(0, targetIndex + 1)` → role/content フィルタ → `trimHistoryForIllustration` の順で、
+**フィルタ後**に絞る（フィルタ前にやると空メッセージや添付のみで件数がズレる）。
+末尾から1件ずつ文字数を足し、上限を超える位置より古い方を捨てる。
+挿絵の対象応答は必ず末尾側にあるので、切り出しで落ちることはない。
+
+### デバッグ
+`illustrationUtils.lastDebug` に `historyRounds` / `historyTotalRounds` / `historyCharCap` /
+`historyCutByChars` を入れ、「デバッグ（挿絵生成用プロンプト）」の先頭に
+`直近 N 往復（会話全体では M 往復）` と `上限: 文字数 …` を出す。
+上限が 0 の場合は「なし（0）」と表示し、文字数で省略した場合は行を足す。
+
+### 検証
+selftest に 11 件（既定の上限文字数 0 / 往復数の設定項目が無い / 上限 0 は全件 / 切ったフラグが立たない /
+残った往復数と全体 / 上限文字数で古い方を捨てる / 切ったフラグ / 切った後の往復数 /
+上限超過でも最後の1件を残す / 空履歴 / 負数は無制限）、e2e に上限文字数の入力欄の存在
+（`type=number`・`min=0`）、上限文字数で古い方を捨てる動作、上限 0 で全件送る動作を追加した。
+
+## 8. 既定の画像プロンプト（2026-10-11 改訂）
+
+`DEFAULT_ILLUSTRATION_PROMPT_TEMPLATE` を全面的に書き換えた。SillyTavern 既定ではなく本アプリのオリジナルのまま、
+中身を昨今の Anima / Krea 2 の挙動に合わせている。
+
+### 長さで縛る
+Anima は **300 トークンを超えると末尾のタグが黙って落ち、埋め込みが平均化されて全体が汎用的になる**
+（コミュニティ計測で 200 語未満がクリーン）。LLM に書かせた長い説明文は追従性が落ちるという報告も多い。
+そこで指示側に `Stay under 160 words.` を置き、「長くなるなら形容詞を削り、人物は削らない」とまで書く。
+Krea 2 は長い prose が良い側だが、密度の高い 160 語なら両側で破綻しない。
+
+### 繰り返す文を落とす
+旧版は最後に「誰が何をしているか」を再述する文を要求していた。DiT + LLM テキストエンコーダ系は
+**人物ごとに閉じた文で属性を紐付ければ混線は減り、同じ概念の繰り返しは逆にノイズ**という知見に合わせて削除。
+接触・手の担当は人物文の中で名前付きで書く側に寄せている。
+
+### 出力形を人数ごとに2つ示す
+1人用の形と2人用の形をそれぞれテンプレートとして提示する。1人用の形は `solo` で完結させ、
+「もう1人を足す」構造にしない（旧版は 2 人分の例しかなかった）。1行目は
+`count, solo, camera, place, time or weather` の順で、**奥行き語を1行目に置かない**。
+奥行きは手前の物体・人物の層・奥へ引く背景の順の文で作り、人物を background へ回す做法は禁止のまま。
+
+### 否定語を書かせない
+`no` / `not` / `without` を禁じ、`solo`（1人）・`empty`（誰もいない場所）のように**あるものを書かせる**。
+Krea 2 Turbo は CFG 1 でネガティブプロンプトがほぼ効かず、ポジティブ側の否定も無視して対象を出すことがあるため。
+
+### 名前の大小表記
+Anima 公式は **character / series 名は英語の通常の大小表記**、タグは小文字・スペース区切りを推奨する。
+「タグは小文字」の規則と両立するので、名前に限り大文字可と明記した。
+Danbooru と Gelbooru で綴りが違うタグは、英語として読める方を選ぶ運用。
+
+### over-the-shoulder
+カメラの選択肢から外し、「もう1人の肩が実際に写っているときだけ書いてよい」条件にした。
+1人の場面で2人目を誘発するため。
+
+### 検証
+selftest はテンプレートの本文に依存せず、`{{char}}` / `{{user}}` 置換のみを見る（`tools/selftest.js` 216 行以降）。
+本文の語句を変えてもテストは通る。Service Worker のキャッシュ名は `onasapo-chan-cache-v35`。
+
+## 9. 既定の画像プロンプト（2026-10-12 改訂）
+
+`DEFAULT_ILLUSTRATION_PROMPT_TEMPLATE` を全面的に書き換えた。指示文そのものを**日本語**にし、
+出力は従来どおり英語のタグ文だけを狙う。
+
+### 日本語で規則を書く
+指示文を日本語で書き、出力は英語に限定する構成。冒頭で「ロールプレイしない / 物語を止めない /
+説明しない / プロンプトだけ出す」を短く並べ、続く `規則:` の箇条書きで条件を並べる。
+視点は **ユーザーの視点から画面内に見えている人と物だけ**と指定する。
+
+### 長さを縛らない
+前版の `Stay under 160 words.` は外した。人数・層・項目の指定だけで自然な長さになる形にし、
+語数ではなく**書く項目**で密度を制御する。
+
+### 人数タグ
+人物文の数を見えている人数と一致させ、`1girl, solo` や `1girl, 1boy` のように**性別と人数を書く**。
+`people` という単語は禁止。1人用の1行目は `[性別], solo, カメラ1つ, 奥行き, 場所` の順で、
+**奥行き語を1行目に置いた**（前版は場所・時刻の順だった）。
+
+### 奥行きと重なり
+奥行きはカメラと場所で作る（手前の物や面・中間の人物・奥へ引く背景）。1人のときはその人物の層は1つだけ。
+2人以上のときだけ近い順に別の層へ置き、**片方は近くて大きく、もう片方は遠くて一部重なってよい**と
+重なりの扱いまで書く。左右は実際に左右であるときだけ。
+
+### 衣類の状態を推論させる
+`物語の進行状況から現在の衣類や衣類の状態を推論しなさい。衣類の状態とは身につけていないことも含む。`
+を規則に足した。前版は項目の網羅（髪・目・上半身・下半身・靴を全員に書き、空欄にしない、他人の色を
+流用しない、複数人で色を被らせない）だけを見ていたので、場面に応じた衣類の状態を書かせない。
+
+### 結びの形
+最後に動作を一文で言い、**場所・光・カメラで終える**。2人以上用の形は
+`[名前か髪色] [動作], while [もう一人] [動作]. The background recedes behind them.` が末尾の文。
+
+### 既定文に {{char}} / {{user}} が無い
+新しい既定文は人物名をチャット履歴から読ませるため、マクロを含まない。
+`substituteSessionNames` はそのままでも壊れない（置換対象が無ければ本文は変わらない）が、
+**既定文ではセッションの表示名はプロンプトに挿入されない**。自分でテンプレートを編集して
+`{{char}}` / `{{user}}` を書けば、これまでどおり実行時に表示名（未設定なら assistant / user）へ置換される。
+
+### 検証
+既定文がマクロを含まないため、`tools/selftest.js` の `{{char}}` / `{{user}}` 置換テストは
+マクロ入りの見本文字列で行うようにした（既定文に対しては「置換後もマクロが残らない」だけを見る）。
+`tools/e2e.js` の「表示名がテンプレートに置換されている」も、その場面だけマクロ入りの
+テンプレートを設定して確認する。Service Worker のキャッシュ名は `onasapo-chan-cache-v38`。
+
+## 10. 既定の画像プロンプト（2026-10-12 深夜〜10-13 手直し）
+
+`DEFAULT_ILLUSTRATION_PROMPT_TEMPLATE` を5点直した。全面書き換えではなく、前版の形を保ったまま矛盾と発明を止める方向。
+
+### 冒頭の指示無視は対象が存在しなかった
+`buildIllustrationPrompt` は `systemPrompt: ''` で `handleSend` を呼ぶ（`index.html` の `context` の組み立て）。
+つまり quiet 生成には **user/model の履歴と指示文だけ**が送られ、システムプロンプトもキャラカードも入っていない。
+前版の `これまでの指示は無視しなさい。ロールプレイするな。物語を止めなさい。` は
+「無視すべき指示がリクエスト内に無い」うえ、弱いモデルでは敵対的な前置きとして挙動を乱しうる。
+作業の説明（`これはチャット本編ではなく、画像生成プロンプトを作成する作業です。…`）へ置き換えた。
+
+派生して分かった制約: **キャラカードの外見は文脈に入っていない**。本家は `getRawLastMessage()` が
+`character.description` / `scenario` を直接結合するのに、本アプリは履歴だけを見ている。
+よって外見の記述が履歴中に無いキャラは毎回髪色・服を発明する（挿絵ごとの揺れの主因）。
+直すなら `buildIllustrationPrompt` の `systemPrompt` にカードの説明文を入れる手がある（未実装）。
+
+### 写る範囲と靴の矛盾
+項目に `[靴]` があったのに写る範囲の指定が無く、膝から下が写らない絵に靴のタグが乗っていた。
+`写る範囲も1つ書く（full body shot / upper body / close-up）。全身を写さないなら靴と脚を書かない` を規則に足し、
+1行目のタグにも `[写る範囲]` を入れた（1人用・2人以上用とも）。人物文の項目列挙からも靴を条件付きにした。
+
+### 前景の発明
+前版の1人用の形は `A [手前の物] sits in the foreground` が必須形で、会話に無い椅子やコップを足させていた。
+規則を「中間の人物と奥へ引く背景は必ず書く。手前の層は会話に実際に写る物があるときだけ置く」へ変え、
+形の直下に `手前に写る物が会話中に無いときは … The [背景] recedes behind them. だけを書く` を置いた。
+
+### 衣類の状態は会話に根拠があるときだけ
+`物語の進行状況から現在の衣類や衣類の状態を推論しなさい。衣類の状態とは身につけていないことも含む。` は
+根拠が無い場面でも脱衣を推論させる方向に働いていた。
+`衣類の状態を書くのは、会話の中で既にそうなっているときだけ。そうでなければ通常時の服装を書く` に絞った。
+
+### 人数タグ
+`1girl, solo` / `1girl, 1boy` の例しかなかったので、同性別2人以上は `2girls` / `2boys`、
+異性別は `1girl, 1boy`、`solo` は1人のときだけ、と明記。`people` 禁止はそのまま。
+
+### 未採用: 語彙の制御の仕方（B10）
+カメラ・光の語彙を列挙すると**弱いモデルは列挙した語しか使わなくなる**という運用上の問題が残っている。
+方針は「例示は引力になるが、禁止語は引力にならない」で、
+① 語彙ではなく場面の物理から選ぶ規則を書く（見上げる相手がいるなら低い位置、光は場所と時刻から決める）、
+② 閉じてよい語彙（写る範囲のように本質的に選択肢が少ないもの）だけ軸として列挙する、
+③ 弱いモデルが逃げる語（`cinematic` `dramatic` `beautiful` など）は禁止側で潰す。
+写る範囲は②で閉じた。カメラと光は①＋③に寄せるのが良さそうだが未適用。
+
+### 検証
+`tools/selftest.js` はテンプレート本文の語句を見ないので、本文変更ではテスト結果は変わらない
+（`{{char}}` / `{{user}}` 置換のみを見る）。Service Worker のキャッシュ名は `onasapo-chan-cache-v39`。
+
+## 11. 既定の画像プロンプト（2026-10-13 午後、場面タグの末尾集約と語彙の導出化）
+
+`DEFAULT_ILLUSTRATION_PROMPT_TEMPLATE` を確定文面で差し替えた。§10 の5点手直しの続きで、
+**場面情報を末尾1行へ集約**し、**カメラと光の語彙を列挙から導出規則へ**替えた。
+
+### 出力の並び順
+`1行目 = 人数のタグだけ` → `人物文` → `奥行きを作る文` → `場面タグ1行（[カメラ], [写る範囲], [場所], [光]）`。
+動機は3つ。
+
+- 前版はカメラが1行目と結びの両方にあり、同じタグを2回書いていた。末尾集約で重複が消える。
+- 末尾1行は形式として用意してあるので、人物文が長くなっても想起ではなく穴埋めになる。
+- §8 の前提（Anima は長いと末尾から落ちる）に従うとき、**落ちる順が重要度の順**になるのが望ましい。
+  残ってほしいのは人数タグと人物の記述なので、1行目は `1girl, solo` だけにする。
+
+副次効果として `場所・光・カメラ・写る範囲は最後の1行にまとめて書き、人物文には混ぜない` が書ける。
+前版は1行目に場面タグがあったため、`standing in the classroom` のように人物文へ場所が漏れる逃げを許していた。
+
+### 奥行きはタグ枠を落とした
+`奥行き` はタグの枠から外し、「中間の人物と奥へ引く背景は必ず書く」文の側で作る。
+`depth` はアニメ系の学習分布に無い語で、`depth of field` は背景をぼかす方向に働く。
+10-11 版は奥行き語を1行目に置かない做法で、10-12 でタグ枠として入れて、また外した。
+
+### 語彙の制御: 例示は引力、禁止語は引力にならない
+カメラと光は語彙を列挙せず、場面の物理から選ぶ規則にした。
+`相手を上に見上げるなら低い位置 / 下に見下ろすなら高い位置 / 並んで立つなら目線`、
+`光は場所と時刻から選ぶ。光源がどこから来ているかを書く（後ろから、横から、上から）`。
+語彙を並べると弱いモデルは並べた語しか使わない。形容（`soft lighting`）は会話から導出できないが、
+光源の方位は座標情報なので履歴から決めることができる。
+弱いモデルが逃げる語は引力にならない禁止側で潰す: `cinematic, dramatic, beautiful, stunning, professional, highly detailed`。
+**写る範囲だけ列挙を残した**（full body shot / upper body / close-up）。本質的に選択肢が少ない語彙は
+引力がむしろ欲しい側で、失われると構図が壊れるので末尾ブロックの中でも前に置いている。
+
+### 見送り: 衣類の状態の条件絞り
+§10 で `衣類の状態を書くのは、会話の中で既にそうなっているときだけ` に絞ったが、**元に戻した**。
+`物語の進行状況から現在の衣類や衣類の状態を推論しなさい。衣類の状態とは身につけていないことも含む。` のまま。
+
+### 文面の照合
+テンプレートは文字列が長いので、確定文面との一致を機械的に見た（38行、一致）。
+index.html から `DEFAULT_ILLUSTRATION_PROMPT_TEMPLATE = \`` から次のバッククォートまでを抜き出し、
+提示された文面と1行ずつ比較する使い捨てスクリプトで行った（リポジトリには置いていない）。
+以後の本文変更でも、同じ抜き出し方式で見本と突き合わせられる。
+
+### 検証
+`tools/selftest.js` は本文の語句を見ないので結果は変わらない（`{{char}}` / `{{user}}` 置換のみを見る）。
+selftest 144/144、`tools/e2e.js` 167/167。Service Worker のキャッシュ名は `onasapo-chan-cache-v40`。

@@ -1,0 +1,173 @@
+# 読み上げ（SillyTavern TTS 拡張 模倣）実装メモ
+
+調査時点: 2026-10-05。調べた範囲は SillyTavern 公式 TTS 拡張の仕様と、OpenAI Compatible な `audio/speech` の呼び出し方のみ。
+
+## 1. 呼び出し仕様
+
+OpenAI の `Create speech` に合わせた 1 発 POST。音声バイトがそのまま返る。
+
+```
+POST {endpoint}/audio/speech
+Authorization: Bearer {api key}      ※ キーを設定した場合だけ
+Content-Type: application/json
+
+{ "model": "...", "voice": "...", "input": "..." }
+→ 200 + 音声バイト（Content-Type: audio/*）
+```
+
+- body は `model` / `voice` / `input` に `stream_format: "sse"` を添えて送る（下の「SSE 受信」）。`speed` や `response_format` は送らない。
+- 速度は再生側の `Audio.playbackRate`（`preservesPitch = true`）で掛ける。これでサーバーの対応状況に依存しない。
+- `input` の上限（OpenAI は 4096 字）を意識し、`TTS_INPUT_CHUNK_CHARS = 1200` で文の切れ目から切る。
+- エンドポイントは末尾スラッシュを落としてから、`/audio/speech` で終わらなければ `/audio/speech` を足す。
+
+### SSE 受信（読み上げを途中で止められるようにするため）
+
+Irodori TTS Server は `stream_format: "sse"` を受け取ると `text/event-stream` で**文ごとに `audio_chunk`** を順に返し、最後に `done` を送る。
+
+```
+event: audio_chunk
+data: {"index":0,"text":"最初の文です。","format":"wav","media_type":"audio/wav","audio_base64":"...","seed":1,"total_to_decode":0.1}
+
+event: done
+data: {"chunks":2}
+```
+
+**中止用 API はサーバー側に無い**。非 stream の 1 発 POST はサーバーが全文を合成してから応答を返し、クライアント切断を一切見ないため、fetch を切っても GPU 合成は走り切る。SSE 経路だけが chunk ごとに合成し、接続が閉じた時点で**まだ合成していない文を作らない**（進行中の 1 chunk は `asyncio.shield` で完了する）。つまり「接続を閉じる」ことが唯一の停止指示になる。
+
+- 判定は `Content-Type` を主役にする。`text/event-stream` でなければ、`stream_format` を無視して音声バイトを返したサーバー（Kokoro 形式など）として 1 本まとめて受け取る。
+- HTTP 400 / 422 なら**本文の文言を問わず** `stream_format` を外して 1 回やり直す。未知の field を嫌うサーバーはエラー本文に field 名を書くと限らないため、本文に `stream_format` が出る場合だけに絞ると OpenAI 互換を名乗るサーバーで読み上げが失敗する。field を外して通ったら原因は field なので、そのエンドポイントを `sseUnsupportedEndpoints`（メモリ専用。settings キーは作らない）へ覚えて以後は付けない。**外しても 400 ならそのまま投げる**（ボイス名違いなどを field のせいにしない）。
+- SSE を返したのに `audio_chunk` を 1 つも受け取らなかったら `Error` を投げる。Irodori 以外の SSE の形（`audio.delta` 等）だと無音で終わり、何が起きたか分からなくなるため。
+- `Accept` ヘッダーは送らない（preflight を増やさないため）。
+- パースは `splitSseFrames()`（空行でフレーム分割、切りかけは `next` に残す）と `parseSseFrame()`（`event` / `data`、複数行 `data` は連結、コメント行は無視）の純粋関数 2 本。`handleSseFrame()` が `audio_chunk` を base64 → Blob → objectURL にして呼び出し側へ渡し、`error` イベントは投げる。
+
+SillyTavern 側で参考にした点: `skip_codeblocks`（``` と ~~~ を除く）、`apply_regex` + `regex_pattern`（送信前の正規表現フィルタ 1 本）、`narrate_dialogues_only`、voice map による話者割当、`ttsJobQueue` + `currentTtsJob` による直列再生。
+
+## 2. 本リポジトリでの場所
+
+| 項目 | 場所（index.html） |
+| --- | --- |
+| 定数 | `TTS_SPEAKER_SLOTS = 5`, `TTS_INPUT_CHUNK_CHARS = 1200`, `VOICE_KIND_ORDER`, `VOICE_KIND_LABELS`（一覧の種別ラベル） |
+| ユーティリティ | `const ttsUtils = { ... }`（`comfyWorkflowUtils` の直後） |
+| 設定の既定値 | `state.settings` の `tts*`。既定値にキーを足せば `loadSettings` / `saveSettings` が自動的に保存・復元する |
+| 設定画面 | `<details class="settings-group" id="settings-group-tts">`（挿絵生成の直後） |
+| 設定の UI 反映 | `uiUtils.applyTtsSettingsToUI()`（`applySettingsToUI()` から呼ぶ） |
+| 設定の保存 | `saveSettings()` 内の `newSettings.tts*` |
+| 要素参照 | `const elements` の `tts*` |
+| 入力欄付近のボタン | `<button id="tts-mode-toggle-btn">`。`mode-auto` = 赤地、`mode-manual` = グレー地（挿絵生成と同じ CSS クラスを再利用） |
+| 応答ごとのボタン | `appendMessage` の actions 生成部。`.js-tts-btn` |
+| クリック処理 | `messageContainer` の委譲内、`js-tts-btn` → `appLogic.speakMessage(index)` |
+| 自動読み上げ | `handleSend` 成功後、挿絵の自動生成の直後 |
+| 参照ボイス一覧の取得 | `ttsUtils` の `normalizeApiBase` / `voicesUrlCandidates` / `parseVoicesPayload` / `voicesToInput` / `mergeVoiceSelection`（純粋、自己テスト対象）と `fetchVoices` + `voicesCache`（`fetch` と `elements` を使う） |
+| 一覧のチェックボックス | `div#tts-voice-list`。描画は `uiUtils.renderTtsVoiceCheckboxes()`、チェック反映は `applyVoiceChecksToSettings()`、取得後は `applyFetchedVoices()`、件数と種別内訳は `updateTtsVoiceListStatus()`。選択値の取り込みは `snapshotTtsVoiceSelection()` に共通化 |
+| テスト再生 | `ttsUtils.testVoice()`（`#tts-voice-test-btn`）。読み上げキューとは別に鳴り、`stopAll()` の対象外 |
+| SSE 受信 | `ttsUtils` の `speechRequestBase` / `postSpeech` / `streamSpeech` / `splitSseFrames` / `parseSseFrame` / `handleSseFrame` / `base64ToBlob`。SSE を嫌うエンドポイントを覚える `sseUnsupportedEndpoints`（メモリのみ） |
+| 削除時の停止 | `ttsUtils.stopForMessages()`（job の `message` 参照で判定）。呼び出し側は `deleteMessage` / `confirmDeleteCascadeResponse` / `retryFromMessage` / `startNewChat` / `loadChat` / `confirmClearAllHistory` / `confirmClearAllData` |
+
+APIキーは `ttsApiKey` として IndexedDB の `settings` にだけ保存する。既定は空文字で、リポジトリにもファイル書き出しにも出さない。
+
+## 3. 本文から読み上げ断片を作る順
+
+`message.content` を使う。挿絵プロンプトは `message.illustration.prompt` にあり、そもそも本文に含まれない。
+
+`cleanForSpeech()`:
+
+1. 全角・半角の吸収（`（）`→`()`、`：`→`:`、`“”`→`"`、全角スペース→半角）。**以降は常に半角形**なので、ユーザの正規表現も半角形で書く
+2. 正規表現フィルタ（1 本）。不正なパターンは警告して無視し、読み上げ自体は落とさない
+3. コードブロック（``` / ~~~）とインラインコード
+4. URL（`http(s)://` と `www.`）
+5. Markdown の装飾（画像、リンクはラベルだけ残す、HTMLタグ、見出し、引用、区切り線、箇条書き、`***`/`**`/`__`/`_`/`~~`/`*`、表の `|`）
+6. 空白を詰める（行構造は話者検出に使うので残す）
+
+## 4. 話者検出
+
+正規化した行を左から走査し、`isSpeakerBoundary()` が真の位置で名前を**最長順**に完全一致で試す。
+
+- 境界 = 行頭、改行後、`。！？!?…〜` や開き括弧・引用符の直後
+- 名前の直後に CJK / 英数字が続く場合は部分一致とみなして使わない（`まゆみみ` で `まゆみ` を拾わない）
+
+名前の直後を `matchSpeakerTail()` で消費する。心理描写 `(...)` と セリフ `「」『』""` を**続く限り**まとめて話者本人のボイスにする。これで 1〜3 番の形と、`まゆみ（笑）「あ」（泣）「い」` のような連続を同時に扱える。何も消費できなければ `:` / `：` + 行の残りを 4 番として扱う。それも無ければ名前は地の文の一部。
+
+残った区間は `splitGeneric()` で、引用・括弧は汎用ボイス、その他は地の文に分ける。
+
+「地の文を読まずセリフだけ読み上げる」は `narration` の断片だけをキューから落とす。心理描写は残す。
+
+ボイスが未設定の断片は読まない（デフォルトボイス未設定なら地の文だけ落ちる）。
+
+## 5. 段落ごとの読み上げ（受信しながら送る）
+
+応答全文の受信完了を待たず、確定した段落から順に TTS へ送る。段落は `paragraphRanges()` が決める。
+**空行で区切る。空行が無い応答では改行で区切る。**原文上の位置も返す（送信済み位置を覚えるため）。
+
+- コードブロックの中は段落の区切りとして数えない。`fenceSpans()` が閉じたフェンスを 1 単位にし、
+  閉じていないフェンスの開始位置を返す。`feedStream()` はその位置までしか送らない（未完了のコードを読まない）。
+- `feedStream()` は「末尾の未完了段落を除いた範囲」までを送り、`stream.fed` に送った本文を覚えておく。
+  同じ本文を渡しても再送しない。
+- `finishStream()` は受信完了時に残り（末尾の未完了段落）を送る。校正で本文が書き換わっていた場合は、
+  共通プレフィックスの後から送り直す。
+- `stopAll()` は `stream.suppressed` を立てるので、停止後にまだ送っていない段落は送られない。
+- 手動（メガホン）は `enqueueMessage()` から `enqueueText()` で全文を同じ段落順に送る。
+
+`buildSegments()` は段落ごとに `buildParagraphSegments()` を呼ぶ。話者検出・地の文除外・コードブロック除去は段落ごとに適用される。
+
+## 6. 再生キュー
+
+`ttsUtils.queue` と `playing` フラグで直列化する。`pump()` は `playing` の間に再入しない。job は 1 段落ぶんで、SSE なら 1 job ぶんから**複数の音声断片**が届く。
+
+- `playJob()` は受信と再生を分ける。受信（`streamSpeech`）は再生を待たずに次の chunk を受け取り、`received` に objectURL を積む。再生側は `received` を**順に 1 本ずつ** `playClip()` で鳴らすので、音が重なることはない。受信を待たずに進めるのは、サーバーの合成を止めないため（サーバーは再生の速度に合わせて合成されない）。
+- `playClip()` は `Audio` 1 本を `ended` / `error` まで鳴らして解決する。`playbackRate` と `preservesPitch` はここだけ。objectURL は再生を終った側で revoke する。
+- job には `message`（読み上げている応答オブジェクト）を入れる。`enqueueMessage()` はメッセージオブジェクトを渡し、受信しながら送る分は `stream.jobRefs` に覚えておき、応答が確定した時点で `attachStreamMessage()` が後から付ける（`beginStream()` の時点ではメッセージオブジェクトがまだ無い）。
+- 送信中のリクエストは `inflightControllers`（`AbortController` の Set）で追う。
+
+`stopPlayback()` は `generation` を増やし、`inflightControllers` をすべて `abort()` し、現在の `Audio` を pause して objectURL を revoke する。pause しただけでは `playClip()` の待ちが残るので `currentClipSettler` を呼んで起こす。`stopAll()` はこれにキュー破棄と `stream.suppressed = true` を足したもの。
+
+`generation` を見る理由は 2 つ。停止後に届いた音を鳴らさないためと、**停止済みの `pump()` が `playing` を書き戻して後続の再生と競わない**ため（`playing` を落とすのは `stopPlayback()` だけ）。停止で `play()` が中断されると `AbortError` になるが、これも `generation` で区別して失敗ダイアログを出さない。
+
+## 7. 削除時の停止
+
+応答を削除したら、その応答の読み上げはその場で止まる。
+
+| 操作 | 止める範囲 |
+| --- | --- |
+| 「削除」（`deleteMessage`）とカスケード応答の「この応答を削除」（`confirmDeleteCascadeResponse`） | `stopForMessages(削除するメッセージオブジェクト)`。キューからその応答の job だけ除き、再生中ならその job だけ止める。**別の応答を読んでいればそのまま続く** |
+| リトライ（`retryFromMessage`）で未来の履歴を消す | `stopForMessages(捨てられる応答たち)`。残る応答は読み続ける |
+| 新規チャット（`startNewChat`） / チャット読み込み（`loadChat`） / 全履歴削除（`confirmClearAllHistory`） / 全データ削除（`confirmClearAllData`） | `stopAll()`。セッション削除や最終メッセージ削除後は `startNewChat` を通る |
+
+削除は `state.isSending` 中できないので、受信しながらの読み上げ中に削除されることはない（応答確定後の削除にだけ効く）。
+
+`stopForMessages()` は削除を確定した直後、`splice` や `saveChat` より前に呼ぶ。保存の `await` の後に呼ぶと、その間も読み上げが続く。
+
+サーバー側は SSE の接続を閉めることで以降の文の合成をやめる（1 節）。**SSE 非対応サーバーでは PWA 側だけが止まり、送信済みのリクエスト（最大 1200 字の段落）はサーバーで最後まで走り切る**点に注意。
+
+## 8. テスト
+
+```
+node tools/tts-selftest.js   # 話者検出・整形・chunk・段落送り・削除時の停止・SSE パース・一覧の純粋関数をブラウザなしで（118 件）
+node tools/selftest.js       # 挿絵生成（143 件）
+node tools/e2e.js            # 実ブラウザ + モックサーバー（167 件）
+```
+
+`tools/e2e.js` には OpenAI Compatible な `audio/speech` もどきを `/mock-tts/v1/audio/speech` に立ててある。送られた body のキー集合、`Authorization`、話者ごとの `voice`、`input` の中身をサーバー側で記録して検証する。再生の重複は `window.Audio` を包んで同時再生数を数え、最大 1 であることを確認している。Chrome には `--autoplay-policy=no-user-gesture-required --mute-audio` を渡す。
+
+SSE と停止は `/mock-tts-sse/v1/audio/speech`（`text/event-stream` で `audio_chunk` を 3 個、200ms 間隔で送る）で見る。**レスポンス側の `close` を `writableEnded` で判定**して、クライアントが切れた時点までに送れた chunk 数を記録する（`req` の `close` は本文を読み終えただけでも発火するので、それを abort として数えると誤る）。読み上げ中に `deleteMessage()` を呼ぶと、① `playing` とキューが空になり、② 新しい `Audio` がこれ以上作られず、③ サーバー側の記録が `chunksSent < 3`（以降の文を合成していない）ことを確認する。`/mock-tts-plain/v1/audio/speech` は `stream_format` を無視して音声を返すサーバー（Kokoro 形式）、`/mock-tts-strict/v1/audio/speech` は `stream_format` を 400 で嫌うサーバーで、それぞれ 1 本まとめての再生と field を外した送り直しを見る。`/mock-tts-opaque/v1/audio/speech` は 400 の本文に field 名を書かないサーバー（`{"error":{"message":...}}`）で、本文の文言を問わず field を外して再生できることを見る。`/mock-tts-sse-empty/v1/audio/speech` は `text/event-stream` を返すが `audio_chunk` を寄越さないサーバーで、無音にならず `elements.ttsStatus` へ失敗が出ることを見る。`streamSpeech` 自体は `tools/tts-selftest.js` でも `speechRequestBase` と `postSpeech` だけを差し替えて検証する（`response.body` を `null` にすると `text()` 経由の経路を通る）。同時再生数の最大 1 は**削除で pause した音声の `ended` が発火しない**ので、削除が走る前の値で検査する。
+
+一覧は `/mock-tts/v1/audio/voices`（Irodori 形）、`/mock-tts-alt/v1/audio/voices`→404 ＋ `/mock-tts-alt/v1/voices`（Kokoro 形）、`/mock-tts-auth/v1/audio/voices`→401、`/mock-tts-missing/*`→404 を立てて、フォールバック順・401 で全候補を回さないこと・非対応でも詳細欄の入力が話者選択へ反映されること・キャッシュ（`force` の有无）・GET に `Content-Type` を付けないことを確認する。**一覧取得は入力欄の URL を優先するので、テストも `state.settings.ttsEndpoint` だけでなく `elements.ttsEndpointInput.value` を切り替える**（state だけ変えると同じ接続先を叩き続ける）。
+
+## 9. 参照ボイス一覧の取得
+
+Irodori-TTS-Server は `GET /v1/audio/voices` を持ち、Voices フォルダのファイル stem を `id` として返す
+（`{"object":"list","data":[{"id":"momo","ref_wav":"...","ref_latents":[...],"no_ref":false}]}`）。
+LocalAI・vLLM-Omni・Chatterbox-TTS-Server も同じパスを持つが、Kokoro-FastAPI は `{"voices":[...]}` と形が違う。
+**エンドポイントも戻り値も統一されていない**前提で、`voicesUrlCandidates` が `/audio/voices` → `/voices` の順に試し、
+`parseVoicesPayload` が `data.data` / `data.voices` / 素の配列と、要素の文字列・`id`・`name` を吸収する。
+
+- **接続確認に `/health` は使わない**。Irodori 固有なので、他の OpenAI Compatible サーバーで接続確認が壊れる。
+  一覧の fetch がそのまま接続確認を兼ねる（HTTP が返れば接続OK、`fetch` の TypeError は CORS 側）。
+- 401/403 は他の候補も同じ認証で落ちるため回さずに止まる。全候補が 404 系なら `error.code = 'unsupported'` を投げ、
+  呼び出し側で「接続OK（…非対応の可能性）」として**詳細欄のカンマ区切り入力**を話者選択へ反映する。
+- SW が合成した 503 を 404（非対応）と誤読しないよう、`isServiceWorkerNetworkError` を ok 判定より前に見る。
+  GET には `Content-Type` を付けない（preflight を誘発する）。`cache: 'no-store'` は SW のキャッシュ優先経路用。
+- 保存形式は `ttsVoices`（カンマ区切り）のまま。種別は `voicesCache` のメモリ専用で、settings キーを作らない
+  （既定値にキーを足すと自動保存される仕組みがあるため）。
+- 一覧から消えた保存値はチェック済みで残り、選択中の値はプルダウンの「（一覧に無い保存値）」として残る。
+  チェックを外しても、その voice がデフォルト・汎用・話者割当で**選択中**ならプルダウンには残り続ける（仕様）。
+

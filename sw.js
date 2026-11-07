@@ -1,0 +1,195 @@
+// sw.js
+
+const CACHE_NAME = 'onasapo-chan-cache-v46'; // この番号を上げることが「新しい版」の合図になる (上げると SW が再インストールされ、画面上部の更新バナーが出る)
+const urlsToCache = [
+  './', // ルートパス (index.html を指すことが多い)
+  './index.html',
+  './manifest.json',
+  './marked.js',
+  // アイコンファイルもキャッシュする場合 (manifest.json で指定したもの)
+  './icon-192x192.png',
+];
+
+// インストール時にキャッシュを作成
+self.addEventListener('install', (event) => {
+  event.waitUntil(
+    caches.open(CACHE_NAME)
+      .then((cache) => {
+        console.log('SW: Opened cache');
+        // ネットワーク状況が不安定な場合、addAllが失敗することがある
+        // 個別にaddしてエラーを無視するか、必須リソースのみにするなどの考慮も可能
+        return cache.addAll(urlsToCache).catch(error => {
+          console.error('SW: Failed to cache initial resources during install:', error);
+        });
+      })
+  );
+  // skipWaiting() はここで呼ばない。
+  // 呼ぶと新しい SW が即アクティブになり、開いているページへ更新を通知する余地がなくなる。
+  // 新しい SW は waiting 状態で待機し、ページ側の更新バナーで「更新する」を押された時だけ
+  // 下の message リスナー経由で skipWaiting される。
+});
+
+// ループバック・プライベート・Tailscale (100.64.0.0/10) のホスト名か
+function isPrivateHost(hostname) {
+  if (!hostname) return false;
+  if (hostname === 'localhost' || hostname.endsWith('.local')) return true;
+  return /^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|100\.)/.test(hostname);
+}
+
+// フェッチイベントの処理
+self.addEventListener('fetch', (event) => {
+  const requestUrl = new URL(event.request.url);
+
+  // APIリクエスト (Google APIへのPOST) はキャッシュ戦略から除外し、常にネットワークへ
+  if (requestUrl.hostname === 'generativelanguage.googleapis.com' && event.request.method === 'POST') {
+    event.respondWith(fetch(event.request));
+    return; // このリクエストに対するService Workerの処理はここで終了
+  }
+
+  // ローカル・LAN・Tailscale の ComfyUI などプライベートアドレスへの要求はインターセプトしない。
+  // Chrome 142 以降の Local Network Access は「公開オリジン → ローカル」の接続をユーザー許可で門番するが、
+  // Service Worker からのリクエストは許可ダイアログを出せず、事前に許可された origin でないと失敗する。
+  // ここで respondWith すると要求が SW 経由になり、ダイアログ自体が表示されないまま失敗する。
+  // 応答を返さなければブラウザ本体がページ文脈で処理し、許可ダイアログが正常に出る。
+  // （以前の問題だった「キャッシュ優先戦略が接続失敗を合成 503 に化けさせて CORS 判別を壊す」も、
+  //   いずれにせよこの分岐を通らないので同時に解消される。）
+  if (isPrivateHost(requestUrl.hostname)) {
+    return;
+  }
+
+  // NovelAI の画像生成 API はキャッシュ対象外。SW を通さずブラウザ本体に任せる
+  if (requestUrl.hostname === 'image.novelai.net') {
+    return;
+  }
+
+  // それ以外のリクエスト (主にGET) はキャッシュ優先戦略 (Cache falling back to network)
+  event.respondWith(
+    caches.match(event.request)
+      .then((response) => {
+        // キャッシュヒットした場合
+        if (response) {
+          // console.log('SW: Serving from cache:', event.request.url);
+          return response;
+        }
+
+        // キャッシュミスした場合、ネットワークから取得
+        // console.log('SW: Fetching from network:', event.request.url);
+        return fetch(event.request).then(
+          (networkResponse) => {
+            // ネットワークから正常に取得できた場合
+            // オプション: 取得したリソースをキャッシュに追加する (GETリクエストのみ)
+            // ここでは urlsToCache に含まれるものだけを動的にキャッシュする例
+            if (networkResponse && networkResponse.status === 200 && event.request.method === 'GET') {
+               // urlsToCache に含まれるパスかチェック (完全一致またはルートパス)
+               const isCachable = urlsToCache.some(url => {
+                   // './' は requestUrl.pathname が '/' または '/index.html' にマッチするかで判断
+                   if (url === './') return requestUrl.pathname === '/' || requestUrl.pathname === '/index.html';
+                   // それ以外はパス部分が一致するかで判断
+                   return requestUrl.pathname.endsWith(url.substring(1)); // './' を除いて比較
+               });
+
+               if (isCachable) {
+                    // console.log('SW: Caching new resource:', event.request.url);
+                    const responseToCache = networkResponse.clone(); // レスポンスは一度しか読めないのでクローンする
+                    caches.open(CACHE_NAME)
+                      .then(cache => {
+                        cache.put(event.request, responseToCache);
+                      });
+               }
+            }
+            return networkResponse; // 取得したレスポンスをブラウザに返す
+          }
+        ).catch(error => {
+          // ネットワークフェッチが失敗した場合 (オフラインなど)
+          console.error('SW: Fetch failed for:', event.request.url, error);
+          // ここでオフライン用の代替レスポンスを返すこともできる
+          // 例: return new Response('Network error', { status: 503, statusText: 'Service Unavailable' });
+          // ユーザーにオフラインであることを示すための基本的なJSONレスポンス例
+          if (event.request.headers.get('accept').includes('application/json')) {
+            return new Response(JSON.stringify({ error: 'Offline or network error' }), {
+              status: 503, // Service Unavailable
+              headers: { 'Content-Type': 'application/json' }
+            });
+          }
+          // HTMLページへのナビゲーションリクエストならオフラインページを返すなど
+          // if (event.request.mode === 'navigate') {
+          //   return caches.match('./offline.html');
+          // }
+          // その他の場合は、デフォルトのエラーレスポンスを返す
+          return new Response('Network error occurred.', {
+            status: 503,
+            statusText: 'Service Unavailable'
+          });
+        });
+      })
+  );
+});
+
+// activateイベントで古いキャッシュを削除 & クライアント制御の要求
+self.addEventListener('activate', (event) => {
+  const cacheWhitelist = [CACHE_NAME];
+  event.waitUntil(
+    caches.keys().then((cacheNames) => {
+      return Promise.all(
+        cacheNames.map((cacheName) => {
+          if (cacheWhitelist.indexOf(cacheName) === -1) {
+            console.log('SW: Deleting old cache:', cacheName);
+            return caches.delete(cacheName);
+          }
+        })
+      );
+    }).then(() => {
+      // 新しいService Workerがアクティブになったら、すぐにクライアントを制御する
+      return self.clients.claim();
+    })
+  );
+});
+
+// メッセージリスナー (キャッシュクリア用)
+self.addEventListener('message', (event) => {
+  // ページ側の更新バナーで「更新する」が押された: 待機中の SW をアクティブにする。
+  // アクティブになると activate の clients.claim() が走り、ページ側で controllerchange が発火して再読み込みされる。
+  if (event.data && event.data.action === 'skipWaiting') {
+    console.log('SW: skipWaiting requested from the page.');
+    event.waitUntil(self.skipWaiting());
+    return;
+  }
+
+  if (event.data && event.data.action === 'clearCache') {
+    console.log('SW: Clearing cache...');
+    caches.keys().then((cacheNames) => {
+      return Promise.all(
+        cacheNames.map((cacheName) => {
+          return caches.delete(cacheName);
+        })
+      );
+    }).then(() => {
+      console.log('SW: Cache cleared.');
+      // クライアントに完了を通知 (任意)
+      // event.source is not always available, use clients.matchAll
+      self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(clients => {
+          clients.forEach(client => {
+              client.postMessage({ status: 'cacheCleared' });
+          });
+      });
+
+      // Service Worker自体を更新するために登録解除とリロードを促す
+      self.registration.unregister().then(() => {
+         console.log('SW: Service Worker unregistered. Reload required.');
+         // クライアントにリロードを促すメッセージを送る
+         self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(clients => {
+             clients.forEach(client => {
+                 client.postMessage({ action: 'reloadPage' });
+             });
+         });
+      });
+    }).catch(error => {
+      console.error('SW: Failed to clear cache:', error);
+       self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(clients => {
+          clients.forEach(client => {
+              client.postMessage({ status: 'cacheClearFailed', error: error.message });
+          });
+      });
+    });
+  }
+});
