@@ -12294,8 +12294,12 @@ const dbUtils = {
                     + ' Chrome で「ローカルネットワークへのアクセス」の確認が出たら許可してください。';
             },
 
-            async describeHttpError(response) {
+            async describeHttpError(response, base) {
                 const text = await response.text().catch(() => '');
+                // Service Worker が接続失敗の代わりに合成する 503。LLM の応答ではないので接続エラーとして出す
+                if (response.status === 503 && /Network error occurred\.|Offline or network error/.test(text)) {
+                    return this.networkErrorMessage(base || '', new Error('Service Worker 経由でも届きませんでした'));
+                }
                 let detail = '';
                 try {
                     const data = JSON.parse(text);
@@ -12315,7 +12319,7 @@ const dbUtils = {
                 } catch (error) {
                     throw new Error(this.networkErrorMessage(base, error));
                 }
-                if (!response.ok) throw new Error(await this.describeHttpError(response));
+                if (!response.ok) throw new Error(await this.describeHttpError(response, base));
                 const data = await response.json().catch(() => null);
                 const list = data && Array.isArray(data.data) ? data.data : (data && Array.isArray(data.models) ? data.models : []);
                 return list.map(item => (typeof item === 'string' ? item : (item && (item.id || item.name)) || ''))
@@ -12351,7 +12355,7 @@ const dbUtils = {
                         if (signal && signal.aborted) throw new Error('挿絵の生成を中断しました。');
                         throw new Error(this.networkErrorMessage(base, error));
                     }
-                    if (!response.ok) throw new Error(await this.describeHttpError(response));
+                    if (!response.ok) throw new Error(await this.describeHttpError(response, base));
                     const data = await response.json().catch(() => null);
                     if (!data) throw new Error('画像プロンプト用LLMの応答を JSON として読めませんでした。');
                     const usage = data.usage || null;

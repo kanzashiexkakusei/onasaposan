@@ -1,6 +1,6 @@
 // sw.js
 
-const CACHE_NAME = 'onasapo-chan-cache-v47'; // この番号を上げることが「新しい版」の合図になる (上げると SW が再インストールされ、画面上部の更新バナーが出る)
+const CACHE_NAME = 'onasapo-chan-cache-v48'; // この番号を上げることが「新しい版」の合図になる (上げると SW が再インストールされ、画面上部の更新バナーが出る)
 const urlsToCache = [
   './', // ルートパス (index.html を指すことが多い)
   './index.html',
@@ -33,6 +33,8 @@ self.addEventListener('install', (event) => {
 function isPrivateHost(hostname) {
   if (!hostname) return false;
   if (hostname === 'localhost' || hostname.endsWith('.local')) return true;
+  // Tailscale の MagicDNS 名（tailscale serve の https 入口など）。iPhone は https でしか届かないためこちらを使う
+  if (hostname.endsWith('.ts.net')) return true;
   return /^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|100\.)/.test(hostname);
 }
 
