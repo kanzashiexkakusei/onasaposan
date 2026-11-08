@@ -8529,7 +8529,59 @@ font-size: 1.142em !important;
                         </details>
                         </div>
 
-                        <details style="margin-top: 15px; border: 1px solid var(--border-tertiary); border-radius: 5px;">
+                        <details open style="margin-top: 15px; border: 1px solid var(--border-tertiary); border-radius: 5px;">
+                            <summary style="cursor: pointer; font-size: 13px; padding: 8px; font-weight: bold; color: var(--text-secondary);">
+                                画像プロンプトを作るLLM
+                            </summary>
+                            <div style="padding: 10px; padding-top: 5px;">
+                                <label for="illustration-llm-mode-select">使うLLM:</label>
+                                <select id="illustration-llm-mode-select" aria-label="画像プロンプトを作るLLM">
+                                    <option value="session">チャットと同じLLM（API料金がかかります）</option>
+                                    <option value="custom">別のLLM（ローカル LLM など OpenAI 互換 API）</option>
+                                </select>
+                                <div id="illustration-llm-custom-settings">
+                                    <p style="font-size: 11px; color: var(--text-secondary); margin-top: 0; margin-bottom: 10px;">
+                                        ※ 画像プロンプト作りだけを、Ollama / LM Studio / KoboldCpp などの OpenAI 互換 API へ任せます。チャットのAPI料金はかからず、チャット側のモデルに拒否されることもありません。<br>
+                                        ※ URL の例: Ollama <code>http://127.0.0.1:11434/v1</code>、LM Studio <code>http://127.0.0.1:1234/v1</code>、KoboldCpp <code>http://127.0.0.1:5001/v1</code>。スマホから使うときは <code>127.0.0.1</code> を PC の Tailscale IP に置き換えます。<br>
+                                        <span style="color: var(--text-error);">※ 公開ページから接続するには LLM 側で CORS の許可が必要です。Ollama は環境変数 <code>OLLAMA_ORIGINS</code> にこのページのオリジン（例: <code>https://ユーザー名.github.io</code>）を、LM Studio は Developer 画面で「Enable CORS」をオンにします。KoboldCpp は既定で許可されています。</span><br>
+                                        ※ ローカル LLM は扱える文字数が少ないことが多いので、下の「挿絵生成の推論に使う履歴の上限」を 4000〜8000 文字程度にするのがおすすめです。
+                                    </p>
+                                    <label for="illustration-llm-base-url">API の URL:</label>
+                                    <input type="text" id="illustration-llm-base-url" placeholder="例: http://127.0.0.1:11434/v1"
+                                        aria-label="画像プロンプト用LLMの API URL">
+                                    <label for="illustration-llm-api-key">API キー（不要なら空欄）:</label>
+                                    <input type="password" id="illustration-llm-api-key" autocomplete="off"
+                                        aria-label="画像プロンプト用LLMの API キー">
+                                    <label for="illustration-llm-model">モデル名:</label>
+                                    <div style="display: flex; gap: 6px; align-items: flex-start;">
+                                        <input type="text" id="illustration-llm-model" list="illustration-llm-model-list"
+                                            placeholder="例: llama3.1:8b" aria-label="画像プロンプト用LLMのモデル名" style="flex: 1 1 auto;">
+                                        <datalist id="illustration-llm-model-list"></datalist>
+                                        <button type="button" id="illustration-llm-test-btn" class="settings-action-button" style="font-size: 12px; flex: 0 0 auto;">接続確認＆モデル一覧</button>
+                                    </div>
+                                    <span id="illustration-llm-status" style="font-size: 12px; color: var(--text-secondary);"></span>
+                                    <div style="display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px;">
+                                        <div style="flex: 1 1 140px;">
+                                            <label for="illustration-llm-max-tokens">最大出力トークン:</label>
+                                            <input type="number" id="illustration-llm-max-tokens" min="64" max="32768" step="64">
+                                        </div>
+                                        <div style="flex: 1 1 140px;">
+                                            <label for="illustration-llm-temperature">temperature:</label>
+                                            <input type="number" id="illustration-llm-temperature" min="0" max="2" step="0.05">
+                                        </div>
+                                        <div style="flex: 1 1 140px;">
+                                            <label for="illustration-llm-timeout-ms">タイムアウト (ms):</label>
+                                            <input type="number" id="illustration-llm-timeout-ms" min="5000" max="600000" step="1000">
+                                        </div>
+                                    </div>
+                                    <p style="font-size: 11px; color: var(--text-secondary); margin-top: 0; margin-bottom: 0;">
+                                        ※ 思考（reasoning）するモデルは思考にも出力トークンを使うので、最大出力トークンを多めにしてください。<code>&lt;think&gt;</code> の中身は自動で取り除きます。
+                                    </p>
+                                </div>
+                            </div>
+                        </details>
+
+                        <details style="margin-top: 10px; border: 1px solid var(--border-tertiary); border-radius: 5px;">
                             <summary style="cursor: pointer; font-size: 13px; padding: 8px; font-weight: bold; color: var(--text-secondary);">
                                 プロンプト合成
                             </summary>
@@ -8557,7 +8609,7 @@ font-size: 1.142em !important;
                             <div style="padding: 10px; padding-top: 5px;">
                                 <textarea id="comfy-image-prompt-template" rows="12" aria-label="挿絵生成用プロンプト"></textarea>
                                 <p style="font-size: 11px; color: var(--text-secondary); margin-top: -5px;">
-                                    ※ 本編のチャット履歴を文脈にしたうえで、この指示文でクラウドLLMに挿絵用の文を書かせます。その文はチャットには残さず、画像生成だけに使います。
+                                    ※ 本編のチャット履歴を文脈にしたうえで、この指示文で LLM（上の「画像プロンプトを作るLLM」で選んだもの）に挿絵用の文を書かせます。その文はチャットには残さず、画像生成だけに使います。
                                 </p>
                                 <button id="comfy-template-reset-btn" class="settings-action-button" style="font-size: 12px;">既定に戻す</button>
                                 <hr style="margin: 12px 0; border-top: 1px dashed var(--border-secondary);">
@@ -9896,6 +9948,17 @@ elevationHoverOption: document.getElementById('elevation-hover-option'),
             comfyImagePromptTemplateTextarea: document.getElementById('comfy-image-prompt-template'),
             comfyTemplateResetBtn: document.getElementById('comfy-template-reset-btn'),
             comfyHistoryCharCapInput: document.getElementById('comfy-history-char-cap'),
+            illustrationLlmModeSelect: document.getElementById('illustration-llm-mode-select'),
+            illustrationLlmCustomSettings: document.getElementById('illustration-llm-custom-settings'),
+            illustrationLlmBaseUrlInput: document.getElementById('illustration-llm-base-url'),
+            illustrationLlmApiKeyInput: document.getElementById('illustration-llm-api-key'),
+            illustrationLlmModelInput: document.getElementById('illustration-llm-model'),
+            illustrationLlmModelList: document.getElementById('illustration-llm-model-list'),
+            illustrationLlmTestBtn: document.getElementById('illustration-llm-test-btn'),
+            illustrationLlmStatus: document.getElementById('illustration-llm-status'),
+            illustrationLlmMaxTokensInput: document.getElementById('illustration-llm-max-tokens'),
+            illustrationLlmTemperatureInput: document.getElementById('illustration-llm-temperature'),
+            illustrationLlmTimeoutMsInput: document.getElementById('illustration-llm-timeout-ms'),
             comfyWidthInput: document.getElementById('comfy-width'),
             comfyHeightInput: document.getElementById('comfy-height'),
             comfyStepsInput: document.getElementById('comfy-steps'),
@@ -10164,6 +10227,14 @@ geminiIncludeThoughts: false,
                 novelaiCfgRescale: DEFAULT_NOVELAI_CFG_RESCALE,
                 novelaiSeed: -1, // -1 で毎回ランダム
                 novelaiTimeoutMs: DEFAULT_NOVELAI_TIMEOUT_MS,
+                // ▼ 画像プロンプトを作るLLM ▼ 'session' = チャットと同じ / 'custom' = 別の OpenAI 互換 API（ローカル LLM など）
+                illustrationLlmMode: 'session',
+                illustrationLlmBaseUrl: '',
+                illustrationLlmApiKey: '',
+                illustrationLlmModel: '',
+                illustrationLlmMaxTokens: 1024,
+                illustrationLlmTemperature: 0.7,
+                illustrationLlmTimeoutMs: 120000,
                 comfyBaseUrl: DEFAULT_COMFY_BASE_URL,
                 // 複数ワークフロー管理（旧 comfyWorkflow 単一文字列からは loadSettings で移行する）
                 // 初期値は同梱の Anima 用 2 件。自分で登録すれば上書きできる
@@ -12153,6 +12224,149 @@ const dbUtils = {
                 const data = await response.json().catch(() => null);
                 const version = data && data.system && data.system.comfy_version ? ` (comfyui ${data.system.comfy_version})` : '';
                 return `接続OK${version}`;
+            },
+        };
+
+        // ═══════════════════════════════════════════════════════════
+        // 画像プロンプトを作る別の LLM（Ollama / LM Studio / KoboldCpp など OpenAI 互換 API）。
+        // チャット側の高価なモデルや検閲の強いモデルを使わずに済ませるため、quiet 生成だけをここへ送る。
+        // elements / state に触れないので、自己テスト（tools/selftest.js）で検証する
+        // ═══════════════════════════════════════════════════════════
+        const illustrationLlmUtils = {
+            // 末尾スラッシュと /chat/completions を外す。ホストだけなら /v1 を足す
+            normalizeBaseUrl(raw) {
+                let url = String(raw || '').trim().replace(/\/+$/, '');
+                url = url.replace(/\/chat\/completions$/i, '').replace(/\/models$/i, '').replace(/\/+$/, '');
+                if (!url) return '';
+                if (!/^https?:\/\//i.test(url)) url = 'http://' + url;
+                try {
+                    const parsed = new URL(url);
+                    if (parsed.pathname === '/' || parsed.pathname === '') url = url.replace(/\/?$/, '/v1');
+                } catch (e) { /* そのまま返す（fetch 時にエラーを出す） */ }
+                return url;
+            },
+
+            headers(apiKey) {
+                const headers = { 'Content-Type': 'application/json' };
+                const key = String(apiKey || '').trim();
+                if (key) headers['Authorization'] = `Bearer ${key}`;
+                return headers;
+            },
+
+            // チャット履歴（role: user / model）＋最後に指示文を user として付ける
+            buildMessages(history, instruction) {
+                const messages = (Array.isArray(history) ? history : [])
+                    .filter(msg => msg && (msg.role === 'user' || msg.role === 'model') && msg.content)
+                    .map(msg => ({ role: msg.role === 'model' ? 'assistant' : 'user', content: String(msg.content) }));
+                messages.push({ role: 'user', content: String(instruction || '') });
+                return messages;
+            },
+
+            buildRequestBody(opts) {
+                const o = opts || {};
+                const body = {
+                    model: String(o.model || ''),
+                    messages: this.buildMessages(o.history, o.instruction),
+                    stream: false,
+                };
+                const maxTokens = Number(o.maxTokens);
+                if (Number.isFinite(maxTokens) && maxTokens > 0) body.max_tokens = Math.round(maxTokens);
+                const temperature = Number(o.temperature);
+                if (Number.isFinite(temperature)) body.temperature = temperature;
+                return body;
+            },
+
+            // 応答本文。思考を別欄（reasoning_content）で返すモデルは本文だけを使う。
+            // 本文中の <think>…</think> は processReply 側で落とす
+            extractContent(data) {
+                const choice = data && Array.isArray(data.choices) ? data.choices[0] : null;
+                if (!choice) return '';
+                if (choice.message && typeof choice.message.content === 'string') return choice.message.content;
+                if (typeof choice.text === 'string') return choice.text;
+                return '';
+            },
+
+            // 接続失敗の説明。CORS と Local Network Access で落ちることが多いので対処も書く
+            networkErrorMessage(base, error) {
+                return `LLM（${base}）に接続できませんでした (${error && error.message ? error.message : 'fetch 失敗'})。`
+                    + ' LLM が起動しているか、URL が正しいかを確認してください。'
+                    + ' 公開ページから使う場合は LLM 側で CORS の許可が必要です（Ollama は OLLAMA_ORIGINS、LM Studio は Enable CORS）。'
+                    + ' Chrome で「ローカルネットワークへのアクセス」の確認が出たら許可してください。';
+            },
+
+            async describeHttpError(response) {
+                const text = await response.text().catch(() => '');
+                let detail = '';
+                try {
+                    const data = JSON.parse(text);
+                    detail = (data && data.error && (data.error.message || data.error)) || (data && data.message) || '';
+                } catch (e) {
+                    detail = text.slice(0, 300);
+                }
+                return `LLM がエラーを返しました (HTTP ${response.status})${detail ? `: ${detail}` : ''}`;
+            },
+
+            async fetchModels(rawBase, apiKey) {
+                const base = this.normalizeBaseUrl(rawBase);
+                if (!base) throw new Error('API の URL が空です。');
+                let response;
+                try {
+                    response = await fetch(`${base}/models`, { method: 'GET', headers: this.headers(apiKey) });
+                } catch (error) {
+                    throw new Error(this.networkErrorMessage(base, error));
+                }
+                if (!response.ok) throw new Error(await this.describeHttpError(response));
+                const data = await response.json().catch(() => null);
+                const list = data && Array.isArray(data.data) ? data.data : (data && Array.isArray(data.models) ? data.models : []);
+                return list.map(item => (typeof item === 'string' ? item : (item && (item.id || item.name)) || ''))
+                    .filter(Boolean);
+            },
+
+            // 1 回だけ生成して { content, usageMetadata } を返す
+            async generate(opts, signal) {
+                const o = opts || {};
+                const base = this.normalizeBaseUrl(o.baseUrl);
+                if (!base) throw new Error('画像プロンプト用LLMの API の URL が設定されていません。設定の「挿絵生成 → 画像プロンプトを作るLLM」で入力してください。');
+                if (!String(o.model || '').trim()) throw new Error('画像プロンプト用LLMのモデル名が設定されていません。');
+                const controller = new AbortController();
+                let timedOut = false;
+                const onAbort = () => controller.abort();
+                if (signal) {
+                    if (signal.aborted) throw new Error('挿絵の生成を中断しました。');
+                    signal.addEventListener('abort', onAbort, { once: true });
+                }
+                const timeoutMs = Math.max(5000, Number(o.timeoutMs) || 120000);
+                const timer = setTimeout(() => { timedOut = true; controller.abort(); }, timeoutMs);
+                try {
+                    let response;
+                    try {
+                        response = await fetch(`${base}/chat/completions`, {
+                            method: 'POST',
+                            headers: this.headers(o.apiKey),
+                            body: JSON.stringify(this.buildRequestBody(o)),
+                            signal: controller.signal,
+                        });
+                    } catch (error) {
+                        if (timedOut) throw new Error(`画像プロンプト用LLMの応答が ${Math.round(timeoutMs / 1000)} 秒以内に返りませんでした（タイムアウト）。`);
+                        if (signal && signal.aborted) throw new Error('挿絵の生成を中断しました。');
+                        throw new Error(this.networkErrorMessage(base, error));
+                    }
+                    if (!response.ok) throw new Error(await this.describeHttpError(response));
+                    const data = await response.json().catch(() => null);
+                    if (!data) throw new Error('画像プロンプト用LLMの応答を JSON として読めませんでした。');
+                    const usage = data.usage || null;
+                    return {
+                        content: this.extractContent(data),
+                        usageMetadata: usage ? {
+                            promptTokenCount: usage.prompt_tokens,
+                            candidatesTokenCount: usage.completion_tokens,
+                            totalTokenCount: usage.total_tokens,
+                        } : null,
+                    };
+                } finally {
+                    clearTimeout(timer);
+                    if (signal) signal.removeEventListener('abort', onAbort);
+                }
             },
         };
 
@@ -17550,6 +17764,23 @@ elements.footerTapScrollToBottomToggle.checked = state.settings.footerTapScrollT
                     + 'プロバイダーが使用量を返さなかった応答は数えていません。';
                 bar.classList.remove('hidden');
             },
+            applyIllustrationLlmSettingsToUI() {
+                if (!elements.illustrationLlmModeSelect) return;
+                const s = state.settings;
+                elements.illustrationLlmModeSelect.value = s.illustrationLlmMode === 'custom' ? 'custom' : 'session';
+                elements.illustrationLlmBaseUrlInput.value = s.illustrationLlmBaseUrl || '';
+                elements.illustrationLlmApiKeyInput.value = s.illustrationLlmApiKey || '';
+                elements.illustrationLlmModelInput.value = s.illustrationLlmModel || '';
+                elements.illustrationLlmMaxTokensInput.value = s.illustrationLlmMaxTokens ?? 1024;
+                elements.illustrationLlmTemperatureInput.value = s.illustrationLlmTemperature ?? 0.7;
+                elements.illustrationLlmTimeoutMsInput.value = s.illustrationLlmTimeoutMs ?? 120000;
+                this.updateIllustrationLlmVisibility();
+            },
+            updateIllustrationLlmVisibility() {
+                if (!elements.illustrationLlmCustomSettings) return;
+                elements.illustrationLlmCustomSettings.style.display =
+                    elements.illustrationLlmModeSelect.value === 'custom' ? '' : 'none';
+            },
             // 選択中のバックエンドに関係する欄だけを表示する
             updateIllustrationBackendVisibility() {
                 const backend = elements.illustrationBackendSelect && elements.illustrationBackendSelect.value === 'novelai'
@@ -17612,6 +17843,7 @@ elements.footerTapScrollToBottomToggle.checked = state.settings.footerTapScrollT
                 elements.illustrationEnabledToggle.checked = !!state.settings.illustrationEnabled;
                 elements.illustrationModeSelect.value = state.settings.illustrationMode === 'manual' ? 'manual' : 'auto';
                 this.applyNovelAISettingsToUI();
+                this.applyIllustrationLlmSettingsToUI();
                 elements.comfyBaseUrlInput.value = state.settings.comfyBaseUrl || '';
                 elements.comfyPromptPrefixTextarea.value = state.settings.comfyPromptPrefix || '';
                 elements.comfyCharacterPrefixTextarea.value = state.settings.comfyCharacterPrefix || '';
@@ -19538,6 +19770,38 @@ _setupParamSlider(paramId, defaultValue, storageKey) {
                     elements.showTokenUsageToggle.addEventListener('change', () => {
                         state.settings.showTokenUsage = elements.showTokenUsageToggle.checked;
                         uiUtils.renderChatMessages(true);
+                    });
+                }
+                // ▼ 画像プロンプトを作るLLM ▼
+                if (elements.illustrationLlmModeSelect) {
+                    elements.illustrationLlmModeSelect.addEventListener('change', () => uiUtils.updateIllustrationLlmVisibility());
+                }
+                if (elements.illustrationLlmTestBtn) {
+                    elements.illustrationLlmTestBtn.addEventListener('click', async () => {
+                        const status = elements.illustrationLlmStatus;
+                        status.textContent = '接続確認中…';
+                        status.style.color = 'var(--text-secondary)';
+                        try {
+                            const models = await illustrationLlmUtils.fetchModels(
+                                elements.illustrationLlmBaseUrlInput.value, elements.illustrationLlmApiKeyInput.value);
+                            elements.illustrationLlmModelList.innerHTML = '';
+                            models.forEach(name => {
+                                const option = document.createElement('option');
+                                option.value = name;
+                                elements.illustrationLlmModelList.appendChild(option);
+                            });
+                            // モデル名が空なら先頭を入れておく
+                            if (!elements.illustrationLlmModelInput.value.trim() && models.length) {
+                                elements.illustrationLlmModelInput.value = models[0];
+                            }
+                            status.textContent = models.length
+                                ? `接続OK（モデル ${models.length} 件。モデル名の欄で候補から選べます）`
+                                : '接続OK（モデル一覧は空でした。モデル名を手で入力してください）';
+                            status.style.color = 'var(--text-success, var(--text-link))';
+                        } catch (error) {
+                            status.textContent = error.message;
+                            status.style.color = 'var(--text-error, var(--text-link))';
+                        }
                     });
                 }
                 // ▼ 挿絵生成（NovelAI）▼
@@ -21816,20 +22080,36 @@ helpIcons.forEach(icon => {
                 const historyCharCap = state.settings.illustrationHistoryCharCap ?? DEFAULT_ILLUSTRATION_HISTORY_CHAR_CAP;
                 const trimmed = illustrationUtils.trimHistoryForIllustration(history, historyCharCap);
 
-                const credentials = this.resolveSessionApiCredentials();
-                const context = {
-                    sessionId: null,
-                    messages: trimmed.messages,
-                    systemPrompt: '',
-                    inputText: quietTemplate,
-                    attachments: [],
-                    apiProvider: credentials.provider,
-                    _apiKeyOverride: credentials.apiKey,
-                    _modelNameOverride: credentials.modelName,
-                    streamingOutput: false,
-                };
-
-                const response = await this.handleSend(false, -1, context, false);
+                let response;
+                const useCustomLlm = state.settings.illustrationLlmMode === 'custom';
+                if (useCustomLlm) {
+                    // 別の LLM（ローカル LLM など）へ直接送る。チャット側の API 料金はかからない
+                    const s = state.settings;
+                    response = await illustrationLlmUtils.generate({
+                        baseUrl: s.illustrationLlmBaseUrl,
+                        apiKey: s.illustrationLlmApiKey,
+                        model: s.illustrationLlmModel,
+                        maxTokens: s.illustrationLlmMaxTokens,
+                        temperature: s.illustrationLlmTemperature,
+                        timeoutMs: s.illustrationLlmTimeoutMs,
+                        history: trimmed.messages,
+                        instruction: quietTemplate,
+                    }, state.illustrationJob ? state.illustrationJob.controller.signal : null);
+                } else {
+                    const credentials = this.resolveSessionApiCredentials();
+                    const context = {
+                        sessionId: null,
+                        messages: trimmed.messages,
+                        systemPrompt: '',
+                        inputText: quietTemplate,
+                        attachments: [],
+                        apiProvider: credentials.provider,
+                        _apiKeyOverride: credentials.apiKey,
+                        _modelNameOverride: credentials.modelName,
+                        streamingOutput: false,
+                    };
+                    response = await this.handleSend(false, -1, context, false);
+                }
                 const rawReply = (response && response.content) || '';
                 const processed = illustrationUtils.processReplyAuto(rawReply);
                 const keywords = processed.text;
@@ -21861,7 +22141,8 @@ helpIcons.forEach(icon => {
                     keywords: keywords,
                     finalPrompt: finalPrompt,
                     negativePrompt: negativePrompt,
-                    usageMetadata: (response && response.usageMetadata) || null,
+                    // 別の LLM（ローカルなど）の分は料金がかからないので、会話の合計には入れない
+                    usageMetadata: useCustomLlm ? null : ((response && response.usageMetadata) || null),
                 };
             },
             // 挿絵生成の入口。同時実行は1件に制限し、実行中の再要求は断る。
@@ -24399,6 +24680,14 @@ newSettings.footerTapScrollToBottom = elements.footerTapScrollToBottomToggle.che
                 newSettings.novelaiCfgRescale = getComfyNumber(elements.novelaiCfgRescaleInput, DEFAULT_NOVELAI_CFG_RESCALE, 0, 1);
                 newSettings.novelaiSeed = Math.round(getComfyNumber(elements.novelaiSeedInput, -1, -1, 4294967295));
                 newSettings.novelaiTimeoutMs = Math.round(getComfyNumber(elements.novelaiTimeoutMsInput, DEFAULT_NOVELAI_TIMEOUT_MS, 5000, 600000));
+                // ▼ 画像プロンプトを作るLLM ▼ API キーは IndexedDB にだけ保存する
+                newSettings.illustrationLlmMode = elements.illustrationLlmModeSelect.value === 'custom' ? 'custom' : 'session';
+                newSettings.illustrationLlmBaseUrl = illustrationLlmUtils.normalizeBaseUrl(elements.illustrationLlmBaseUrlInput.value);
+                newSettings.illustrationLlmApiKey = elements.illustrationLlmApiKeyInput.value.trim();
+                newSettings.illustrationLlmModel = elements.illustrationLlmModelInput.value.trim();
+                newSettings.illustrationLlmMaxTokens = Math.round(getComfyNumber(elements.illustrationLlmMaxTokensInput, 1024, 64, 32768));
+                newSettings.illustrationLlmTemperature = getComfyNumber(elements.illustrationLlmTemperatureInput, 0.7, 0, 2);
+                newSettings.illustrationLlmTimeoutMs = Math.round(getComfyNumber(elements.illustrationLlmTimeoutMsInput, 120000, 5000, 600000));
                 // 末尾スラッシュは正規化する
                 newSettings.comfyBaseUrl = illustrationUtils.normalizeBaseUrl(elements.comfyBaseUrlInput.value);
                 // ワークフロー一覧は comfyWorkflowUtils 側でその場保存するため、ここでは編集画面の内容を反映するだけ

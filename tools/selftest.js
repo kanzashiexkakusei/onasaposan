@@ -765,6 +765,42 @@ const jsonResponse = (body, status) => ({
         await expectThrow('testToken: 空は拒否', () => novelaiUtils.testToken('  '), /空/);
     }
 
+    // ── 画像プロンプトを作る別の LLM ──────────────────────────
+    {
+        const illustrationLlmUtils = eval(extractObject(html, 'const illustrationLlmUtils = {') + '; illustrationLlmUtils');
+        check('URL: ホストだけなら /v1 を足す', illustrationLlmUtils.normalizeBaseUrl('http://127.0.0.1:11434/'), 'http://127.0.0.1:11434/v1');
+        check('URL: /chat/completions を外す', illustrationLlmUtils.normalizeBaseUrl('http://127.0.0.1:1234/v1/chat/completions'), 'http://127.0.0.1:1234/v1');
+        check('URL: スキーム省略は http', illustrationLlmUtils.normalizeBaseUrl('100.64.1.2:5001/v1'), 'http://100.64.1.2:5001/v1');
+        check('URL: 空', illustrationLlmUtils.normalizeBaseUrl('  '), '');
+        const body = illustrationLlmUtils.buildRequestBody({
+            model: 'm', maxTokens: 512, temperature: 0.5, instruction: '指示',
+            history: [{ role: 'user', content: 'a' }, { role: 'model', content: 'b' }, { role: 'system', content: 'x' }],
+        });
+        check('履歴を OpenAI 形式へ変換して指示文を最後に付ける', body.messages,
+            [{ role: 'user', content: 'a' }, { role: 'assistant', content: 'b' }, { role: 'user', content: '指示' }]);
+        check('生成パラメータ', [body.model, body.max_tokens, body.temperature, body.stream], ['m', 512, 0.5, false]);
+        check('API キーなしは Authorization を付けない', illustrationLlmUtils.headers('').Authorization, undefined);
+
+        let sent = null;
+        globalThis.fetch = (url, init) => {
+            sent = { url, init };
+            return Promise.resolve(new Response(JSON.stringify({
+                choices: [{ message: { content: '<think>...</think>1girl, park', reasoning_content: 'r' } }],
+                usage: { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 },
+            }), { status: 200, headers: { 'content-type': 'application/json' } }));
+        };
+        const out = await illustrationLlmUtils.generate({ baseUrl: 'http://127.0.0.1:11434', model: 'm', history: [], instruction: 'i' }, null);
+        check('generate: 送信先', sent.url, 'http://127.0.0.1:11434/v1/chat/completions');
+        check('generate: 本文と使用量', [out.content, out.usageMetadata.totalTokenCount], ['<think>...</think>1girl, park', 110]);
+        globalThis.fetch = () => Promise.reject(new TypeError('Failed to fetch'));
+        await expectThrow('generate: 接続失敗は CORS の案内付き', () => illustrationLlmUtils.generate({ baseUrl: 'http://h:1/v1', model: 'm' }, null), /OLLAMA_ORIGINS/);
+        globalThis.fetch = () => Promise.resolve(new Response('{"error":{"message":"model not found"}}', { status: 404 }));
+        await expectThrow('generate: HTTP エラーの本文を出す', () => illustrationLlmUtils.generate({ baseUrl: 'http://h:1/v1', model: 'm' }, null), /model not found/);
+        await expectThrow('generate: モデル名なしは送らない', () => illustrationLlmUtils.generate({ baseUrl: 'http://h:1/v1', model: '' }, null), /モデル名/);
+        globalThis.fetch = () => Promise.resolve(new Response(JSON.stringify({ data: [{ id: 'a' }, { id: 'b' }] }), { status: 200 }));
+        check('fetchModels: OpenAI 形式の一覧', await illustrationLlmUtils.fetchModels('http://h:1', ''), ['a', 'b']);
+    }
+
     // ── トークン使用量 ────────────────────────────────────────
     {
         const tokenUsageUtils = eval(extractObject(html, 'const tokenUsageUtils = {') + '; tokenUsageUtils');
