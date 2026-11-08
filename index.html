@@ -8612,6 +8612,11 @@ font-size: 1.142em !important;
                                     ※ 本編のチャット履歴を文脈にしたうえで、この指示文で LLM（上の「画像プロンプトを作るLLM」で選んだもの）に挿絵用の文を書かせます。その文はチャットには残さず、画像生成だけに使います。
                                 </p>
                                 <button id="comfy-template-reset-btn" class="settings-action-button" style="font-size: 12px;">既定に戻す</button>
+                                <button id="comfy-template-novelai-btn" class="settings-action-button" style="font-size: 12px;">NovelAI 用の指示文にする</button>
+                                <p style="font-size: 11px; color: var(--text-secondary); margin-top: 5px; margin-bottom: 0;">
+                                    ※ 既定の指示文は Anima など文章を理解するモデル向けです。NovelAI では Danbooru タグ形式の「NovelAI 用の指示文」がおすすめです。<br>
+                                    ※ NovelAI 用の指示文は品質タグを出さないので、「プロンプト合成」の共通プレフィックスに <code>very aesthetic, masterpiece, no text</code> などを入れてください。
+                                </p>
                                 <hr style="margin: 12px 0; border-top: 1px dashed var(--border-secondary);">
                             <div style="margin-bottom: 6px;">
                                 <label for="comfy-history-char-cap">挿絵生成の推論に使う履歴の上限(文字数):</label>
@@ -9190,6 +9195,40 @@ The person in the foreground is [名前] from [作品]. They have [髪], [目], 
 The person in the midground is [名前] from [作品]. They have [髪], [目], and wear [上], [下], and [靴]. They [表情] and [動作].
 [名前か髪色] [動作], while [もう一人] [動作]. The background recedes behind them.
 [カメラ], [写る範囲], [場所], [光].`;
+
+        // NovelAI（V4 / V4.5 / V5）向け。Danbooru タグをカンマ区切りの 1 行で出させる。
+        // 品質タグ・UC はプロンプト合成のプレフィックス／ネガティブで足すので、ここでは出させない
+        const NOVELAI_ILLUSTRATION_PROMPT_TEMPLATE = `これはチャット本編ではなく、NovelAI で挿絵を生成するためのプロンプトを作る作業です。チャットの続き、説明、前置き、引用符、見出しは書かず、プロンプトだけを出力しなさい。
+
+最後のチャットメッセージの中で、物語の挿絵として最も印象的な瞬間を1枚の画像として切り取り、Danbooru タグで出力しなさい。ユーザーの視点から画面内に見えている人と物だけを書きなさい。
+
+出力の形:
+- 英語の Danbooru タグをカンマとスペース区切りで並べた1行だけ。改行しない。
+- 骨組みは次のとおり。[ ] の部分を埋め、すべての項目を必ず含める:
+  [人数], [solo（1人のとき）], [キャラ名, 作品名（版権のとき）], [外見], [服装], [表情], [動作], [写る範囲], [indoors か outdoors], [場所], [光]
+- タグは小文字で、アンダースコアではなくスペースを使う（例: long hair, school uniform）。
+- 15〜35個程度。同じ意味のタグを重ねない。
+
+タグの順番（この順で並べる）:
+1. 人数: 1girl / 1boy / 2girls / 1girl, 1boy など。1人なら solo を添える。ユーザー（{{user}}）は画面を見ている視点で、画面には写らないので数えない。人数タグは1組だけ書く（2girls と 1girl を同時に書かない）。
+2. 版権キャラクターなら名前と作品名: 例 hatsune miku, vocaloid。オリジナルキャラクターは名前を書かない。
+3. 外見: 髪の色、髪の長さ、髪型、目の色、体型など、見えているもの。
+4. 服装: 物語の進行から今の服装と状態を推論して書く（着崩れ、脱いでいる、濡れているなども含む）。全身が写らないなら靴は書かない。
+5. 表情と感情: smile, blush, open mouth, tears など。
+6. 動作とポーズ: sitting, looking at viewer, holding cup, hand on own cheek など。2人以上なら、誰が何をしているか分かるタグにする（例: hug, holding hands, kiss）。
+7. 構図（必ず書く）: 写る範囲を cowboy shot / upper body / full body / portrait / close-up から1つ。必要ならカメラの向き from above / from below / from side を1つ足す。
+8. 場所と背景（必ず書く）: まず indoors か outdoors のどちらか、続けて bedroom, classroom, park, night, sunset など。
+9. 光と雰囲気: sunlight, backlighting, dim lighting, rain など、場面に合うものだけ。
+
+規則:
+- 台詞、心の声、性格、地の文の説明は捨て、目に見える情報だけをタグにする。
+- 2人以上のときは、それぞれの髪や服の色を取り違えない。誰の特徴か曖昧になるタグは避け、人数タグと動作タグで関係が伝わるようにする。
+- 場面に性的な描写や露出があるときも、やわらげたり省いたりせず、見えているとおりに具体的なタグで書く。
+- 品質タグ（masterpiece, best quality, very aesthetic など）、年代タグ、作家タグ、rating タグは書かない。
+- 重み付け（{tag}、[tag]、1.2::tag::、(tag:1.2)）や文章、日本語は書かない。
+
+出力例:
+1girl, solo, long hair, black hair, blue eyes, school uniform, serafuku, pleated skirt, smile, blush, looking at viewer, sitting, on bench, holding book, cowboy shot, outdoors, park, sunset, orange sky, backlighting, wind, cherry blossoms`;
         // 挿絵生成用プロンプトの生成に送る履歴の上限（文字数）。0 は全件送信。
         // 本家 SillyTavern が Chat Completion 側で持つトークン予算と同じ役割で、
         // 単位を文字数にしているだけ。
@@ -9947,6 +9986,7 @@ elevationHoverOption: document.getElementById('elevation-hover-option'),
             comfyNegativePromptTextarea: document.getElementById('comfy-negative-prompt'),
             comfyImagePromptTemplateTextarea: document.getElementById('comfy-image-prompt-template'),
             comfyTemplateResetBtn: document.getElementById('comfy-template-reset-btn'),
+            comfyTemplateNovelaiBtn: document.getElementById('comfy-template-novelai-btn'),
             comfyHistoryCharCapInput: document.getElementById('comfy-history-char-cap'),
             illustrationLlmModeSelect: document.getElementById('illustration-llm-mode-select'),
             illustrationLlmCustomSettings: document.getElementById('illustration-llm-custom-settings'),
@@ -19761,6 +19801,20 @@ _setupParamSlider(paramId, defaultValue, storageKey) {
                 if (elements.comfyTemplateResetBtn) {
                     elements.comfyTemplateResetBtn.addEventListener('click', () => {
                         elements.comfyImagePromptTemplateTextarea.value = DEFAULT_ILLUSTRATION_PROMPT_TEMPLATE;
+                    });
+                }
+                if (elements.comfyTemplateNovelaiBtn) {
+                    elements.comfyTemplateNovelaiBtn.addEventListener('click', async () => {
+                        const current = elements.comfyImagePromptTemplateTextarea.value.trim();
+                        // 自分で書き換えた指示文を黙って消さない
+                        const isPreset = !current
+                            || current === DEFAULT_ILLUSTRATION_PROMPT_TEMPLATE.trim()
+                            || current === NOVELAI_ILLUSTRATION_PROMPT_TEMPLATE.trim();
+                        if (!isPreset) {
+                            const ok = await uiUtils.showCustomConfirm('今の指示文を NovelAI 用の指示文で置き換えますか？（編集した内容は消えます）');
+                            if (!ok) return;
+                        }
+                        elements.comfyImagePromptTemplateTextarea.value = NOVELAI_ILLUSTRATION_PROMPT_TEMPLATE;
                     });
                 }
                 if (elements.comfyShowDebugToggle) {
